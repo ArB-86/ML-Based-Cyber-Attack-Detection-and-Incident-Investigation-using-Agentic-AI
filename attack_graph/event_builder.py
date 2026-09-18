@@ -135,7 +135,11 @@ def build_attack_events(
 
     if anomalous_only:
         if "predicted_anomaly" in work.columns:
-            work = work[work["predicted_anomaly"].astype(bool)].copy()
+            work["label"] = work["label"].astype(str).str.strip()
+            work = work[
+                work["predicted_anomaly"].astype(bool)
+                & work["label"].str.lower().ne("benign")
+            ].copy()
         elif threshold is not None and "anomaly_score" in work.columns:
             work = work[work["anomaly_score"] < threshold].copy()
         else:
