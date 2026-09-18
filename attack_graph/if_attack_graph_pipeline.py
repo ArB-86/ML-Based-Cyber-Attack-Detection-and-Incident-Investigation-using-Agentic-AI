@@ -22,17 +22,30 @@ LABEL_MAP = {
     "Web Attack � Sql Injection": "Web Attack - SQL Injection",
 }
 
-META = {
-    "flow id",
-    "source ip",
-    "source port",
-    "destination ip",
-    "destination port",
-    "timestamp",
-    "label",
-    "is_attack",
-    "predicted_anomaly",
-    "anomaly_score",
+BENCHMARK_FEATURES = [
+    "protocol","flow duration","total fwd packets","total backward packets",
+    "fwd packets length total","bwd packets length total","fwd packet length max",
+    "fwd packet length min","fwd packet length mean","fwd packet length std",
+    "bwd packet length max","bwd packet length min","bwd packet length mean",
+    "bwd packet length std","flow bytes/s","flow packets/s","flow iat mean",
+    "flow iat std","flow iat max","flow iat min","fwd iat total","fwd iat mean",
+    "fwd iat std","fwd iat max","fwd iat min","bwd iat total","bwd iat mean",
+    "bwd iat std","bwd iat max","bwd iat min","fwd psh flags","fwd urg flags",
+    "fwd header length","bwd header length","fwd packets/s","bwd packets/s",
+    "packet length min","packet length max","packet length mean","packet length std",
+    "packet length variance","fin flag count","syn flag count","rst flag count",
+    "psh flag count","ack flag count","urg flag count","cwe flag count",
+    "ece flag count","down/up ratio","avg packet size","avg fwd segment size",
+    "avg bwd segment size","subflow fwd packets","subflow fwd bytes",
+    "subflow bwd packets","subflow bwd bytes","init fwd win bytes",
+    "init bwd win bytes","fwd act data packets","fwd seg size min","active mean",
+    "active std","active max","active min","idle mean","idle std","idle max","idle min",
+]
+
+# The benchmark notebook removes these eight constant columns before training.
+BENCHMARK_CONSTANT_FEATURES = {
+    "bwd psh flags","bwd urg flags","fwd avg bytes/bulk","fwd avg packets/bulk",
+    "fwd avg bulk rate","bwd avg bytes/bulk","bwd avg packets/bulk","bwd avg bulk rate",
 }
 
 # Reference only. This threshold belongs to the ORIGINAL project's Isolation
@@ -53,23 +66,43 @@ def clean_labels(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def prepare_features(df: pd.DataFrame, feature_columns: list[str] | None = None):
+def prepare_features(
+    df: pd.DataFrame, feature_columns: list[str] | None = None
+):
     work = clean_labels(df)
-    drop_cols = [c for c in work.columns if c.lower() in META]
-    x = work.drop(columns=drop_cols, errors="ignore")
+    normalized = {str(c).strip().lower(): c for c in work.columns}
 
-    x = x.select_dtypes(include=np.number).copy()
-    x = x.replace([np.inf, -np.inf], np.nan)
+    aliases = {
+        "fwd packets length total": ["fwd packets length total", "total length of fwd packets"],
+        "bwd packets length total": ["bwd packets length total", "total length of bwd packets"],
+    }
 
     if feature_columns is None:
-        feature_columns = x.columns.tolist()
+        feature_columns = BENCHMARK_FEATURES.copy()
 
-    missing = [c for c in feature_columns if c not in x.columns]
+    resolved = {}
+    missing = []
+    for canonical in feature_columns:
+        candidates = aliases.get(canonical, [canonical])
+        actual = next((normalized[c] for c in candidates if c in normalized), None)
+        if actual is None:
+            missing.append(canonical)
+        else:
+            resolved[canonical] = actual
+
     if missing:
-        raise ValueError(f"Missing feature columns: {missing}")
+        raise ValueError(f"Missing benchmark-compatible features: {missing}")
 
-    x = x[feature_columns]
+    x = pd.DataFrame(index=work.index)
+    for canonical in feature_columns:
+        x[canonical] = pd.to_numeric(work[resolved[canonical]], errors="coerce")
+
+    x = x.replace([np.inf, -np.inf], np.nan)
+    for col in ("init fwd win bytes", "init bwd win bytes"):
+        if col in x.columns:
+            x[col] = x[col].replace(-1, np.nan)
     x = x.fillna(x.median(numeric_only=True))
+
     return work, x, feature_columns
 
 
