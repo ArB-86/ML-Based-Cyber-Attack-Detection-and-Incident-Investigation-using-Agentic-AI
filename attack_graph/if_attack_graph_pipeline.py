@@ -73,8 +73,46 @@ def prepare_features(
     normalized = {str(c).strip().lower(): c for c in work.columns}
 
     aliases = {
-        "fwd packets length total": ["fwd packets length total", "total length of fwd packets"],
-        "bwd packets length total": ["bwd packets length total", "total length of bwd packets"],
+        "fwd packets length total": [
+            "fwd packets length total",
+            "total length of fwd packets",
+        ],
+        "bwd packets length total": [
+            "bwd packets length total",
+            "total length of bwd packets",
+        ],
+        "packet length min": [
+            "packet length min",
+            "min packet length",
+        ],
+        "packet length max": [
+            "packet length max",
+            "max packet length",
+        ],
+        "avg packet size": [
+            "avg packet size",
+            "average packet size",
+        ],
+        "init fwd win bytes": [
+            "init fwd win bytes",
+            "init_win_bytes_forward",
+            "init win bytes forward",
+        ],
+        "init bwd win bytes": [
+            "init bwd win bytes",
+            "init_win_bytes_backward",
+            "init win bytes backward",
+        ],
+        "fwd act data packets": [
+            "fwd act data packets",
+            "act_data_pkt_fwd",
+            "act data pkt in fwd dir",
+        ],
+        "fwd seg size min": [
+            "fwd seg size min",
+            "min_seg_size_forward",
+            "min seg size forward",
+        ],
     }
 
     if feature_columns is None:
