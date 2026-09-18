@@ -221,8 +221,11 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Match the notebook's Label normalization.
     work["label"] = work["label"].astype(str).str.strip().replace(LABEL_MAP)
 
+    # Only columns that survive into the final 69-feature matrix are mandatory
+    # for model inference. The eight benchmark-constant columns are optional
+    # because some metadata-rich exports omit them entirely; the preprocessing
+    # result is still identical for the 69-feature model.
     missing = [c for c in BENCHMARK_FEATURES if c not in work.columns]
-    missing += [c for c in CONSTANT_FEATURES if c not in work.columns]
     if missing:
         raise ValueError(f"Missing benchmark preprocessing columns: {sorted(set(missing))}")
 
