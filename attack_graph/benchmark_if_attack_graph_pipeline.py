@@ -334,8 +334,170 @@ def evaluate(y_true: pd.Series, scores: np.ndarray, threshold: float) -> dict:
     }
 
 
-def run(data_dir: str, output_dir: str) -> None:
+
+def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
+    """
+    Reproduce isolation_forest.ipynb on the exact cleaned CICIDS2017 Parquet.
+
+    This is the authoritative benchmark verification path. The Parquet is
+    already the output of dataset_preprocessing.ipynb, so no second
+    preprocessing pass is applied here. Split order, benign sampling,
+    Isolation Forest hyperparameters, threshold, and metrics mirror the
+    benchmark notebook.
+    """
+    path = Path(parquet_path)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Benchmark Parquet not found: {path}")
+
+    print(f"Loading benchmark Parquet: {path}")
+    df = pd.read_parquet(path)
+
+    if "Label" not in df.columns:
+        raise ValueError("Benchmark Parquet must contain a 'Label' column")
+
+    X = df.drop(columns=["Label"])
+    y = (df["Label"].astype(str).str.strip() != "Benign").astype(int)
+
+    if X.shape[1] != len(BENCHMARK_FEATURES):
+        raise ValueError(
+            f"Benchmark Parquet must contain exactly {len(BENCHMARK_FEATURES)} "
+            f"features; found {X.shape[1]}"
+        )
+
+    # Keep the Parquet's feature order exactly as stored by the benchmark.
+    # This should match the 69-column representation used by the notebook.
+    if list(X.columns) != BENCHMARK_FEATURES:
+        missing = [c for c in BENCHMARK_FEATURES if c not in X.columns]
+        extra = [c for c in X.columns if c not in BENCHMARK_FEATURES]
+        if missing or extra:
+            raise ValueError(
+                "Benchmark feature columns do not match the expected 69-feature "
+                f"set. Missing={missing}; Extra={extra}"
+            )
+        X = X[BENCHMARK_FEATURES]
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X,
+        y,
+        test_size=0.30,
+        random_state=42,
+        stratify=y,
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=0.50,
+        random_state=42,
+        stratify=y_temp,
+    )
+
+    X_train_benign = X_train[y_train == 0]
+    X_train_benign_sample = X_train_benign.sample(
+        n=MAX_TRAIN_SAMPLES,
+        random_state=42,
+    )
+
+    model = IsolationForest(
+        n_estimators=FINAL_N_ESTIMATORS,
+        max_samples=FINAL_MAX_SAMPLES,
+        max_features=FINAL_MAX_FEATURES,
+        contamination="auto",
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X_train_benign_sample)
+
+    val_scores = model.decision_function(X_val)
+    test_scores = model.decision_function(X_test)
+
+    val_metrics = evaluate(y_val, val_scores, FINAL_THRESHOLD)
+    test_metrics = evaluate(y_test, test_scores, FINAL_THRESHOLD)
+
+    expected = {
+        "roc_auc": 0.8862,
+        "pr_auc": 0.6801,
+        "precision": 0.6386,
+        "recall": 0.7250,
+        "f1": 0.6791,
+        "fpr": 0.0729,
+    }
+    reproduction_check = {
+        metric: {
+            "actual": float(test_metrics[metric]),
+            "expected_notebook": expected[metric],
+            "absolute_delta": float(abs(test_metrics[metric] - expected[metric])),
+            "matches_4dp": round(test_metrics[metric], 4) == expected[metric],
+        }
+        for metric in expected
+    }
+
+    result = {
+        "dataset_rows": int(len(df)),
+        "feature_count": int(X.shape[1]),
+        "train_rows": int(len(X_train)),
+        "validation_rows": int(len(X_val)),
+        "test_rows": int(len(X_test)),
+        "benign_training_sample": int(len(X_train_benign_sample)),
+        "n_estimators": FINAL_N_ESTIMATORS,
+        "max_samples": FINAL_MAX_SAMPLES,
+        "max_features": FINAL_MAX_FEATURES,
+        "contamination": "auto",
+        "random_state": 42,
+        "benchmark_threshold": FINAL_THRESHOLD,
+        "validation": val_metrics,
+        "test": test_metrics,
+        "reproduction_check_against_notebook_output": reproduction_check,
+        "exact_4dp_reproduction": all(
+            item["matches_4dp"] for item in reproduction_check.values()
+        ),
+    }
+
+    (out / "exact_benchmark_reproduction.json").write_text(
+        json.dumps(result, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\nEXACT BENCHMARK REPRODUCTION")
+    print("=" * 60)
+    print(f"Rows                : {len(df):,}")
+    print(f"Features            : {X.shape[1]}")
+    print(f"Train / Val / Test  : {len(X_train):,} / {len(X_val):,} / {len(X_test):,}")
+    print(f"Benign train sample : {len(X_train_benign_sample):,}")
+    print(f"Threshold           : {FINAL_THRESHOLD:.6f}")
+    print(f"ROC-AUC             : {test_metrics['roc_auc']:.4f}")
+    print(f"PR-AUC              : {test_metrics['pr_auc']:.4f}")
+    print(f"Precision           : {test_metrics['precision']:.4f}")
+    print(f"Recall              : {test_metrics['recall']:.4f}")
+    print(f"F1                  : {test_metrics['f1']:.4f}")
+    print(f"FPR                 : {test_metrics['fpr']:.4f}")
+    print(
+        "Exact 4-decimal reproduction:",
+        "YES" if result["exact_4dp_reproduction"] else "NO",
+    )
+
+    return result
+
+
+def run(
+    data_dir: str,
+    output_dir: str,
+    benchmark_parquet: str | None = None,
+) -> None:
     start = time.time()
+
+    if benchmark_parquet:
+        exact_result = reproduce_exact_benchmark(
+            benchmark_parquet,
+            str(Path(output_dir) / "benchmark_verification"),
+        )
+        print(
+            "
+Benchmark verification status:",
+            "EXACT" if exact_result["exact_4dp_reproduction"] else "MISMATCH",
+        )
     data_path = Path(data_dir)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -362,14 +524,20 @@ def run(data_dir: str, output_dir: str) -> None:
     )
 
     train_attack = y.iloc[train_idx]
-    train_benign_idx = train_idx[train_attack.to_numpy() == 0]
-    if len(train_benign_idx) > MAX_TRAIN_SAMPLES:
-        rng = np.random.RandomState(42)
-        train_benign_idx = rng.choice(
-            train_benign_idx,
-            size=MAX_TRAIN_SAMPLES,
-            replace=False,
+    train_benign_frame = pd.DataFrame({
+        "_row_idx": train_idx,
+        "_is_attack": train_attack.to_numpy(),
+    })
+    train_benign_frame = train_benign_frame[train_benign_frame["_is_attack"] == 0]
+
+    # Match isolation_forest.ipynb exactly: pandas.DataFrame.sample(...,
+    # random_state=42), not numpy choice.
+    if len(train_benign_frame) > MAX_TRAIN_SAMPLES:
+        train_benign_frame = train_benign_frame.sample(
+            n=MAX_TRAIN_SAMPLES,
+            random_state=42,
         )
+    train_benign_idx = train_benign_frame["_row_idx"].to_numpy()
 
     print(f"Train rows     : {len(train_idx):,}")
     print(f"Validation rows: {len(val_idx):,}")
@@ -384,7 +552,32 @@ def run(data_dir: str, output_dir: str) -> None:
         random_state=42,
         n_jobs=-1,
     )
-    model.fit(x.iloc[train_benign_idx])
+    if benchmark_parquet:
+        # The exact benchmark model was already fit in the verification helper;
+        # retrain here from the same exact Parquet sample so metadata scoring
+        # uses the identical benchmark training recipe.
+        benchmark_df = pd.read_parquet(benchmark_parquet)
+        benchmark_X = benchmark_df.drop(columns=["Label"])
+        benchmark_y = (
+            benchmark_df["Label"].astype(str).str.strip() != "Benign"
+        ).astype(int)
+        if list(benchmark_X.columns) != BENCHMARK_FEATURES:
+            benchmark_X = benchmark_X[BENCHMARK_FEATURES]
+        X_train, _, y_train, _ = train_test_split(
+            benchmark_X,
+            benchmark_y,
+            test_size=0.30,
+            random_state=42,
+            stratify=benchmark_y,
+        )
+        X_train_benign = X_train[y_train == 0]
+        X_train_benign_sample = X_train_benign.sample(
+            n=MAX_TRAIN_SAMPLES,
+            random_state=42,
+        )
+        model.fit(X_train_benign_sample)
+    else:
+        model.fit(x.iloc[train_benign_idx])
 
     val_scores = model.decision_function(x.iloc[val_idx])
     test_scores = model.decision_function(x.iloc[test_idx])
@@ -529,5 +722,14 @@ if __name__ == "__main__":
         "--output-dir",
         default="benchmark_graph_output",
     )
+    parser.add_argument(
+        "--benchmark-parquet",
+        default=None,
+        help=(
+            "Exact cleaned_cicids2017.parquet used by isolation_forest.ipynb. "
+            "When supplied, the script verifies the benchmark reproduction and "
+            "uses the same benchmark training recipe for metadata scoring."
+        ),
+    )
     args = parser.parse_args()
-    run(args.data_dir, args.output_dir)
+    run(args.data_dir, args.output_dir, args.benchmark_parquet)
