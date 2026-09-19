@@ -150,13 +150,16 @@ CSV_ORDER = [
 FINAL_N_ESTIMATORS = 200
 FINAL_MAX_SAMPLES = 1024
 FINAL_MAX_FEATURES = 1.0
-# Full-precision threshold stored in isolation_forest.ipynb. The notebook\n# displays this as 0.032042 after rounding to six decimals.\nFINAL_THRESHOLD = 0.032042255237655096
+# Full-precision threshold stored in isolation_forest.ipynb. The notebook
+# displays this as 0.032042 after rounding to six decimals.
+FINAL_THRESHOLD = 0.032042255237655096
 MAX_TRAIN_SAMPLES = 500_000
 
 # Runtime versions used by the Colab 2026.07 environment associated with the
 # benchmark execution. IsolationForest can change numerically across
 # scikit-learn versions even with identical data/parameters/random_state.
-BENCHMARK_ENVIRONMENT = {\n    "python": "3.12.13",
+BENCHMARK_ENVIRONMENT = {
+    "python": "3.12.13",
     "scikit-learn": "1.6.1",
     "numpy": "2.0.2",
     "pandas": "2.2.2",
@@ -167,8 +170,10 @@ BENCHMARK_ENVIRONMENT = {\n    "python": "3.12.13",
 
 
 def benchmark_environment_status() -> dict:
-    current = {}
+    current = {"python": platform.python_version()}
     for package in BENCHMARK_ENVIRONMENT:
+        if package == "python":
+            continue
         try:
             current[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
