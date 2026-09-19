@@ -205,7 +205,7 @@ def write_report(
     ]
 
     ranked = evidence.sort_values(
-        ["triage_score", "start_time"],
+        ["triage_score", "incident_start"],
         ascending=[False, True],
     )
 
