@@ -151,19 +151,19 @@ CSV_ORDER = [
 FINAL_N_ESTIMATORS = 200
 FINAL_MAX_SAMPLES = 1024
 FINAL_MAX_FEATURES = 1.0
-# Full-precision threshold stored in isolation_forest.ipynb. The notebook
-# displays this as 0.032042 after rounding to six decimals.
-FINAL_THRESHOLD = 0.032042255237655096
+# Full-precision threshold from the fresh Colab execution of
+# isolation_forest.ipynb. The notebook displays this as 0.032849 after
+# rounding to six decimals.
+FINAL_THRESHOLD = 0.0328486304818542
 MAX_TRAIN_SAMPLES = 500_000
 
-# Runtime versions used by the Colab 2026.07 environment associated with the
-# benchmark execution. IsolationForest can change numerically across
-# scikit-learn versions even with identical data/parameters/random_state.
+# Runtime versions observed in the fresh Colab execution used as the current
+# benchmark reference.
 BENCHMARK_ENVIRONMENT = {
-    "python": "3.12.13",
+    "python": "3.13.15",
     "scikit-learn": "1.6.1",
-    "numpy": "2.0.2",
-    "pandas": "2.2.2",
+    "numpy": "2.1.3",
+    "pandas": "2.2.3",
     "scipy": "1.16.3",
     "pyarrow": "18.1.0",
     "joblib": "1.5.3",
@@ -465,11 +465,11 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
     environment = benchmark_environment_status()
 
     expected = {
-        "roc_auc": 0.8862,
-        "pr_auc": 0.6801,
-        "precision": 0.6386,
-        "recall": 0.7250,
-        "f1": 0.6791,
+        "roc_auc": 0.8876,
+        "pr_auc": 0.6843,
+        "precision": 0.6388,
+        "recall": 0.7252,
+        "f1": 0.6792,
         "fpr": 0.0729,
     }
     reproduction_check = {
