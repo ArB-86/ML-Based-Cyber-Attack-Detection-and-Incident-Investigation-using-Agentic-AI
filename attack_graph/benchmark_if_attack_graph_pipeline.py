@@ -151,10 +151,10 @@ CSV_ORDER = [
 FINAL_N_ESTIMATORS = 200
 FINAL_MAX_SAMPLES = 1024
 FINAL_MAX_FEATURES = 1.0
-# Full-precision threshold from the fresh Colab execution of
-# isolation_forest.ipynb. The notebook displays this as 0.032849 after
-# rounding to six decimals.
-FINAL_THRESHOLD = 0.0328486304818542
+# Threshold displayed by the fresh Colab execution of isolation_forest.ipynb.
+# The notebook prints six decimal places; no unsupported hidden precision is
+# assumed here.
+FINAL_THRESHOLD = 0.032849
 MAX_TRAIN_SAMPLES = 500_000
 
 # Runtime versions observed in the fresh Colab execution used as the current
@@ -499,8 +499,9 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
         "validation": val_metrics,
         "test": test_metrics,
         "reproduction_check_against_notebook_output": reproduction_check,
-        "exact_4dp_reproduction": all(
-            item["matches_4dp"] for item in reproduction_check.values()
+        "exact_4dp_reproduction": (
+            environment["matches"]
+            and all(item["matches_4dp"] for item in reproduction_check.values())
         ),
     }
 
@@ -532,9 +533,20 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
     print(f"Recall              : {test_metrics['recall']:.4f}")
     print(f"F1                  : {test_metrics['f1']:.4f}")
     print(f"FPR                 : {test_metrics['fpr']:.4f}")
+    if environment["matches"]:
+        comparison_status = (
+            "EXACT"
+            if result["exact_4dp_reproduction"]
+            else "NUMERIC_MISMATCH"
+        )
+    else:
+        comparison_status = "REFERENCE_ONLY_RUNTIME_DIFFERENCE"
+
+    result["comparison_status"] = comparison_status
+
     print(
-        "Exact 4-decimal reproduction:",
-        "YES" if result["exact_4dp_reproduction"] else "NO",
+        "Benchmark comparison:",
+        comparison_status,
     )
 
     return result
