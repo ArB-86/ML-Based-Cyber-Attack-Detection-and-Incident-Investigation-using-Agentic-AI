@@ -402,7 +402,7 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
     if "Label" not in df.columns:
         raise ValueError("Benchmark Parquet must contain a 'Label' column")
 
-    X = df.drop(columns=["Label"])
+    X = df.drop(columns=["Label"]).copy()
     y = (df["Label"].astype(str).str.strip() != "Benign").astype(int)
 
     if X.shape[1] != len(BENCHMARK_FEATURES):
@@ -411,10 +411,9 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
             f"features; found {X.shape[1]}"
         )
 
-    # The notebook keeps CICIDS column spelling (e.g. "Flow Duration"),
-    # whereas this integration file uses lowercase canonical names. Normalize
-    # names only; do not reorder the Parquet columns, because column position is
-    # part of exact model reproduction.
+    # Keep the Parquet feature order, then mirror the preprocessing performed
+    # in isolation_forest.ipynb after loading the cleaned Parquet:
+    # +/-inf -> NaN, followed by whole-dataset median imputation.
     parquet_feature_names = [str(c).strip().lower() for c in X.columns]
     if parquet_feature_names != BENCHMARK_FEATURES:
         missing = [c for c in BENCHMARK_FEATURES if c not in parquet_feature_names]
@@ -424,6 +423,20 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
             f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
         )
     X.columns = parquet_feature_names
+
+    X = X.replace([np.inf, -np.inf], np.nan)
+    if X.isna().sum().sum() > 0:
+        X = X.fillna(X.median(numeric_only=True))
+
+    constant_cols = X.columns[X.nunique() <= 1].tolist()
+    if constant_cols:
+        X = X.drop(columns=constant_cols)
+
+    if X.shape[1] != len(BENCHMARK_FEATURES):
+        raise ValueError(
+            "Isolation Forest preprocessing changed the feature count: "
+            f"expected {len(BENCHMARK_FEATURES)}, found {X.shape[1]}"
+        )
 
     X_train, X_temp, y_train, y_temp = train_test_split(
         X,
@@ -626,11 +639,10 @@ def run(
         n_jobs=-1,
     )
     if benchmark_parquet:
-        # The exact benchmark model was already fit in the verification helper;
-        # retrain here from the same exact Parquet sample so metadata scoring
-        # uses the identical benchmark training recipe.
+        # Retrain here from the same exact Parquet sample after applying the
+        # same feature-matrix cleanup used by isolation_forest.ipynb.
         benchmark_df = pd.read_parquet(benchmark_parquet)
-        benchmark_X = benchmark_df.drop(columns=["Label"])
+        benchmark_X = benchmark_df.drop(columns=["Label"]).copy()
         benchmark_y = (
             benchmark_df["Label"].astype(str).str.strip() != "Benign"
         ).astype(int)
@@ -643,6 +655,14 @@ def run(
                 f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
             )
         benchmark_X.columns = benchmark_feature_names
+        benchmark_X = benchmark_X.replace([np.inf, -np.inf], np.nan)
+        if benchmark_X.isna().sum().sum() > 0:
+            benchmark_X = benchmark_X.fillna(
+                benchmark_X.median(numeric_only=True)
+            )
+        constant_cols = benchmark_X.columns[benchmark_X.nunique() <= 1].tolist()
+        if constant_cols:
+            benchmark_X = benchmark_X.drop(columns=constant_cols)
         X_train, _, y_train, _ = train_test_split(
             benchmark_X,
             benchmark_y,
