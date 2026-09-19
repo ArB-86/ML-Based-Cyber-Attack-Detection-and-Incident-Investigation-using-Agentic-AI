@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata as metadata
 import json
 import time
 from pathlib import Path
@@ -151,6 +152,42 @@ FINAL_MAX_SAMPLES = 1024
 FINAL_MAX_FEATURES = 1.0
 FINAL_THRESHOLD = 0.032042
 MAX_TRAIN_SAMPLES = 500_000
+
+# Runtime versions used by the Colab 2026.07 environment associated with the
+# benchmark execution. IsolationForest can change numerically across
+# scikit-learn versions even with identical data/parameters/random_state.
+BENCHMARK_ENVIRONMENT = {
+    "scikit-learn": "1.6.1",
+    "numpy": "2.0.2",
+    "pandas": "2.2.2",
+    "scipy": "1.16.3",
+    "pyarrow": "18.1.0",
+    "joblib": "1.5.3",
+}
+
+
+def benchmark_environment_status() -> dict:
+    current = {}
+    for package in BENCHMARK_ENVIRONMENT:
+        try:
+            current[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            current[package] = None
+
+    mismatches = {
+        package: {
+            "expected": expected,
+            "installed": current.get(package),
+        }
+        for package, expected in BENCHMARK_ENVIRONMENT.items()
+        if current.get(package) != expected
+    }
+    return {
+        "expected": BENCHMARK_ENVIRONMENT,
+        "installed": current,
+        "matches": not mismatches,
+        "mismatches": mismatches,
+    }
 
 
 def _resolve_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -419,6 +456,8 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
     val_metrics = evaluate(y_val, val_scores, FINAL_THRESHOLD)
     test_metrics = evaluate(y_test, test_scores, FINAL_THRESHOLD)
 
+    environment = benchmark_environment_status()
+
     expected = {
         "roc_auc": 0.8862,
         "pr_auc": 0.6801,
@@ -450,6 +489,7 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
         "contamination": "auto",
         "random_state": 42,
         "benchmark_threshold": FINAL_THRESHOLD,
+        "environment": environment,
         "validation": val_metrics,
         "test": test_metrics,
         "reproduction_check_against_notebook_output": reproduction_check,
@@ -470,6 +510,16 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
     print(f"Train / Val / Test  : {len(X_train):,} / {len(X_val):,} / {len(X_test):,}")
     print(f"Benign train sample : {len(X_train_benign_sample):,}")
     print(f"Threshold           : {FINAL_THRESHOLD:.6f}")
+    print(
+        "Environment         :",
+        "MATCH" if environment["matches"] else "MISMATCH",
+    )
+    if not environment["matches"]:
+        for package, detail in environment["mismatches"].items():
+            print(
+                f"  {package}: installed={detail['installed']!r}, "
+                f"expected={detail['expected']!r}"
+            )
     print(f"ROC-AUC             : {test_metrics['roc_auc']:.4f}")
     print(f"PR-AUC              : {test_metrics['pr_auc']:.4f}")
     print(f"Precision           : {test_metrics['precision']:.4f}")
