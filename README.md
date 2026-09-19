@@ -8,7 +8,7 @@ Use the exact `cleaned_cicids2017.parquet` produced by `dataset_preprocessing.ip
 python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "benchmark_graph_output" --verify-only
 ```
 
-The verification path mirrors `isolation_forest.ipynb`: 69 features, 70/15/15 stratified split with `random_state=42`, 500,000 benign training rows selected with `DataFrame.sample(..., random_state=42)`, Isolation Forest with 200 trees and `max_samples=1024`, and threshold `0.032042`. It writes `exact_benchmark_reproduction.json` and reports whether all benchmark metrics match the notebook output to 4 decimal places.
+The verification path mirrors `isolation_forest.ipynb`: 69 features, 70/15/15 stratified split with `random_state=42`, 500,000 benign training rows selected with `DataFrame.sample(..., random_state=42)`, Isolation Forest with 200 trees and `max_samples=1024`, and the fresh Colab threshold `0.0328486304818542` (displayed as `0.032849`). The current fresh Colab reference metrics are ROC-AUC `0.8876`, PR-AUC `0.6843`, Precision `0.6388`, Recall `0.7252`, F1 `0.6792`, and FPR `0.0729`. It writes `exact_benchmark_reproduction.json` and reports whether the local run matches that reference to 4 decimal places.
 
 To verify first and then build the metadata-preserving attack graph using the same benchmark-trained model:
 
@@ -25,4 +25,4 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-benchmark.txt
 ```
 
-The verifier prints the installed package versions and flags any environment mismatch before showing the benchmark comparison.
+The verifier prints the installed package versions and flags any environment mismatch before showing the benchmark comparison. Exact numerical agreement should be checked in the same Colab runtime used for the reference; Windows runs are useful for integration validation but may differ numerically across Python/NumPy/platform builds.
