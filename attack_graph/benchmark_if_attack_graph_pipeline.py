@@ -566,8 +566,15 @@ def run(
         benchmark_y = (
             benchmark_df["Label"].astype(str).str.strip() != "Benign"
         ).astype(int)
-        if list(benchmark_X.columns) != BENCHMARK_FEATURES:
-            benchmark_X = benchmark_X[BENCHMARK_FEATURES]
+        benchmark_feature_names = [str(c).strip().lower() for c in benchmark_X.columns]
+        if benchmark_feature_names != BENCHMARK_FEATURES:
+            missing = [c for c in BENCHMARK_FEATURES if c not in benchmark_feature_names]
+            extra = [c for c in benchmark_feature_names if c not in BENCHMARK_FEATURES]
+            raise ValueError(
+                "Benchmark Parquet feature order/set does not match the expected "
+                f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
+            )
+        benchmark_X.columns = benchmark_feature_names
         X_train, _, y_train, _ = train_test_split(
             benchmark_X,
             benchmark_y,
