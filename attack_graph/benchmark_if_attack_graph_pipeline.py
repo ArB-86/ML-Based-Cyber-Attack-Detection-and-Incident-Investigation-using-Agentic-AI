@@ -277,7 +277,7 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Metadata columns are deliberately excluded so the deduplication semantics
     # match the no-metadata preprocessing notebook.
     raw_numeric = BENCHMARK_FEATURES + sorted(CONSTANT_FEATURES)
-    dedup_columns = raw_numeric + ["label"]
+    dedup_columns = [c for c in raw_numeric if c in work.columns] + ["label"]
     before = len(work)
     work = work.drop_duplicates(subset=dedup_columns, keep="first").reset_index(drop=True)
     print(f"Rows before deduplication: {before:,}")
@@ -295,8 +295,9 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     for col in SENTINEL_FEATURES:
         work[col] = pd.to_numeric(work[col], errors="coerce").replace(-1, np.nan)
 
-    # Remove the exact eight constant columns from the benchmark representation.
-    work = work.drop(columns=sorted(CONSTANT_FEATURES))
+    # Remove the exact eight constant columns when they are present.
+    constant_present = [c for c in sorted(CONSTANT_FEATURES) if c in work.columns]
+    work = work.drop(columns=constant_present)
 
     # Build the 69-feature matrix. This follows the benchmark notebook:
     # numeric conversion, +/-inf -> NaN, then whole-dataset median fill.
@@ -367,17 +368,19 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
             f"features; found {X.shape[1]}"
         )
 
-    # Keep the Parquet's feature order exactly as stored by the benchmark.
-    # This should match the 69-column representation used by the notebook.
-    if list(X.columns) != BENCHMARK_FEATURES:
-        missing = [c for c in BENCHMARK_FEATURES if c not in X.columns]
-        extra = [c for c in X.columns if c not in BENCHMARK_FEATURES]
-        if missing or extra:
-            raise ValueError(
-                "Benchmark feature columns do not match the expected 69-feature "
-                f"set. Missing={missing}; Extra={extra}"
-            )
-        X = X[BENCHMARK_FEATURES]
+    # The notebook keeps CICIDS column spelling (e.g. "Flow Duration"),
+    # whereas this integration file uses lowercase canonical names. Normalize
+    # names only; do not reorder the Parquet columns, because column position is
+    # part of exact model reproduction.
+    parquet_feature_names = [str(c).strip().lower() for c in X.columns]
+    if parquet_feature_names != BENCHMARK_FEATURES:
+        missing = [c for c in BENCHMARK_FEATURES if c not in parquet_feature_names]
+        extra = [c for c in parquet_feature_names if c not in BENCHMARK_FEATURES]
+        raise ValueError(
+            "Benchmark Parquet feature order/set does not match the expected "
+            f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
+        )
+    X.columns = parquet_feature_names
 
     X_train, X_temp, y_train, y_temp = train_test_split(
         X,
@@ -494,8 +497,7 @@ def run(
             str(Path(output_dir) / "benchmark_verification"),
         )
         print(
-            "
-Benchmark verification status:",
+            "\nBenchmark verification status:",
             "EXACT" if exact_result["exact_4dp_reproduction"] else "MISMATCH",
         )
     data_path = Path(data_dir)
