@@ -15,3 +15,14 @@ To verify first and then build the metadata-preserving attack graph using the sa
 ```powershell
 python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "benchmark_graph_output"
 ```
+
+For reproducible benchmark numbers on Windows, use the pinned environment in `requirements-benchmark.txt`:
+
+```powershell
+python -m venv .venv-benchmark
+.\.venv-benchmark\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-benchmark.txt
+```
+
+The verifier prints the installed package versions and flags any environment mismatch before showing the benchmark comparison.
