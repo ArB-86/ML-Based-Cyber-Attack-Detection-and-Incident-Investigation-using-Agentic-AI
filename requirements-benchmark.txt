@@ -1,0 +1,9 @@
+# Exact benchmark runtime used for the Colab 2026.07 environment.
+# Pin these packages before running --verify-only so IsolationForest,
+# DataFrame.sample, and Parquet loading match the benchmark runtime.
+numpy==2.0.2
+pandas==2.2.2
+scipy==1.16.3
+scikit-learn==1.6.1
+pyarrow==18.1.0
+joblib==1.5.3
