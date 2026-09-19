@@ -488,6 +488,7 @@ def run(
     data_dir: str,
     output_dir: str,
     benchmark_parquet: str | None = None,
+    verify_only: bool = False,
 ) -> None:
     start = time.time()
 
@@ -500,6 +501,8 @@ def run(
             "\nBenchmark verification status:",
             "EXACT" if exact_result["exact_4dp_reproduction"] else "MISMATCH",
         )
+        if verify_only:
+            return
     data_path = Path(data_dir)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -581,16 +584,22 @@ def run(
     else:
         model.fit(x.iloc[train_benign_idx])
 
-    val_scores = model.decision_function(x.iloc[val_idx])
-    test_scores = model.decision_function(x.iloc[test_idx])
+    if benchmark_parquet:
+        # Benchmark quality was already evaluated on the exact Parquet test set.
+        # Do not present a metadata-CSV split evaluation as benchmark performance.
+        val_metrics = None
+        test_metrics = exact_result["test"]
+    else:
+        val_scores = model.decision_function(x.iloc[val_idx])
+        test_scores = model.decision_function(x.iloc[test_idx])
 
-    val_metrics = evaluate(y.iloc[val_idx], val_scores, FINAL_THRESHOLD)
-    test_metrics = evaluate(y.iloc[test_idx], test_scores, FINAL_THRESHOLD)
+        val_metrics = evaluate(y.iloc[val_idx], val_scores, FINAL_THRESHOLD)
+        test_metrics = evaluate(y.iloc[test_idx], test_scores, FINAL_THRESHOLD)
 
-    print("\nVALIDATION")
-    print(json.dumps(val_metrics, indent=2))
-    print("\nTEST")
-    print(json.dumps(test_metrics, indent=2))
+        print("\nVALIDATION")
+        print(json.dumps(val_metrics, indent=2))
+        print("\nTEST")
+        print(json.dumps(test_metrics, indent=2))
 
     # Score every cleaned flow using the model trained only on training BENIGN rows.
     all_scores = model.decision_function(x)
@@ -689,10 +698,11 @@ def run(
         "max_samples": FINAL_MAX_SAMPLES,
         "max_features": FINAL_MAX_FEATURES,
         "benchmark_threshold": FINAL_THRESHOLD,
+        "benchmark_verification": exact_result if benchmark_parquet else None,
         "validation": val_metrics,
         "test": test_metrics,
-        "all_flagged_flows": int(df["predicted_anomaly"].sum()),
-        "non_benign_suspicious_flows": int(len(suspicious)),
+        "metadata_scoring_all_flagged_flows": int(df["predicted_anomaly"].sum()),
+        "metadata_scoring_non_benign_suspicious_flows": int(len(suspicious)),
         "attack_events": int(len(events)),
         "graph_nodes": int(graph.number_of_nodes()),
         "graph_edges": int(graph.number_of_edges()),
@@ -733,5 +743,18 @@ if __name__ == "__main__":
             "uses the same benchmark training recipe for metadata scoring."
         ),
     )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help=(
+            "Run only the exact benchmark reproduction against --benchmark-parquet; "
+            "do not load metadata CSVs or build the attack graph."
+        ),
+    )
     args = parser.parse_args()
-    run(args.data_dir, args.output_dir, args.benchmark_parquet)
+    run(
+        args.data_dir,
+        args.output_dir,
+        args.benchmark_parquet,
+        args.verify_only,
+    )
