@@ -1,7 +1,8 @@
-# Benchmark runtime: Colab 2026.07 uses Python 3.12.13.
-# Recreate the venv with Python 3.12 before installing these pins.
-numpy==2.0.2
-pandas==2.2.2
+# Benchmark reference environment observed in the fresh Colab run:
+# Python 3.13.15
+# Model-related pins below match the observed benchmark packages.
+numpy==2.1.3
+pandas==2.2.3
 scipy==1.16.3
 scikit-learn==1.6.1
 pyarrow==18.1.0
