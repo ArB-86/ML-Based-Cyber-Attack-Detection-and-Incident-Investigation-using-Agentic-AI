@@ -33,7 +33,7 @@ $env:OPENAI_API_KEY = "your-api-key"
 $env:OPENAI_MODEL = "gpt-4.1-mini"
 ```
 
-Run an offline smoke test with an event ID that actually exists in your events file:
+Run an offline smoke test with an event ID that actually exists in your events file. To list IDs first, use `python -c "import pandas as pd; print(pd.read_csv('benchmark_graph_output/attack_events.csv')['event_id'].head(10).to_list())"`:
 
 ```powershell
 python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --offline --output-dir "agentic_investigation_output"
