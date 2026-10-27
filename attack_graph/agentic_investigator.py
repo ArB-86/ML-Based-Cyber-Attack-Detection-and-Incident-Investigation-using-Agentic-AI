@@ -9,11 +9,7 @@ from typing import Any
 import networkx as nx
 import pandas as pd
 
-from .incident_investigator import (
-    REQUIRED_EVENT_COLUMNS,
-    build_graph_context,
-    load_events,
-)
+from .incident_investigator import load_events
 
 
 SYSTEM_INSTRUCTIONS = """You are a cybersecurity incident investigation assistant.
@@ -106,9 +102,7 @@ def related_event_records(
         _json_safe(row.to_dict())
         for _, row in related.head(max_related).iterrows()
     ]
-    graph_context = build_graph_context(graph_path, pd.DataFrame([{
-        "event_id": target_id
-    }])) if False else {}
+    graph_context: dict[str, Any] = {}
     if graph_path:
         graph = nx.read_gexf(graph_path)
         node = f"event:{target_id}"
