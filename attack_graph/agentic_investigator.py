@@ -490,20 +490,19 @@ def _guard_unsupported_auth_outcome_claims(
     score = target.get("mean_anomaly_score")
     label = str(target.get("attack_type", "unknown"))
     evidence_text = [
-        f"The CICIDS dataset labels this event {label!r}; the label alone does not establish outcome.",
+        f"The CICIDS dataset labels this event {label!r}; the label alone does not establish attack impact.",
         (
             f"The mean Isolation Forest decision score is {float(score):.6f}; "
-            f"scores below {ISOLATION_FOREST_THRESHOLD:.6f} are flagged as anomalous, "
-            "not successful or failed authentication."
+            f"scores below {ISOLATION_FOREST_THRESHOLD:.6f} are flagged as anomalous. "
+            "An anomaly score does not prove attack success, failure, or impact."
         ) if score is not None and not pd.isna(score) else
-        "No authentication outcome field is present in the supplied event record.",
+        "The supplied event record does not contain an explicit attack-outcome or impact field.",
     ]
 
     assertion = re.compile(
         r"(?i)\b(?:(?:un)?successful(?:ly)?|succeeded|failed|failure|"
         r"successfully compromised|did not succeed|didn't succeed|did not fail|didn't fail)\b"
     )
-    outcome_unknown = "The authentication outcome is unknown from the supplied flow and graph evidence."
 
     hypotheses = investigation.get("hypotheses", [])
     if not isinstance(hypotheses, list):
@@ -513,7 +512,16 @@ def _guard_unsupported_auth_outcome_claims(
             continue
         claim = str(hypothesis.get("claim", ""))
         if assertion.search(claim):
-            hypothesis["claim"] = outcome_unknown
+            # Mention authentication only if the hypothesis actually discusses
+            # authentication/login; do not misframe DoS or other attacks as auth.
+            if re.search(r"(?i)\b(authentication|authenticat(?:e|ion|ed|ing)|login|logon)\b", claim):
+                hypothesis["claim"] = (
+                    "The authentication outcome is unknown from the supplied flow and graph evidence."
+                )
+            else:
+                hypothesis["claim"] = (
+                    "The supplied flow and graph evidence does not establish whether the attack achieved its intended impact."
+                )
             hypothesis["confidence"] = "low"
             hypothesis["supporting_evidence"] = evidence_text.copy()
 
