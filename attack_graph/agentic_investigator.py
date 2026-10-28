@@ -237,6 +237,7 @@ def _ask_llm(
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
+            max_tokens=1800,
         )
     except Exception as exc:
         if provider == "ollama":
@@ -288,6 +289,7 @@ def _ask_llm(
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.0,
+                max_tokens=1800,
             )
             repaired_body = repair_response.choices[0].message.content
             if repaired_body:
