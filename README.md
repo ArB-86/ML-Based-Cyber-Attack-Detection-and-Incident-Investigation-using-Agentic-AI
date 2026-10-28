@@ -18,7 +18,7 @@ python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cici
 
 ## Agentic AI incident investigation
 
-The optional `attack_graph.agentic_investigator` module builds on the existing event table and GEXF graph. It correlates nearby events, retrieves graph-neighborhood evidence, optionally accepts a risk-assessment JSON record, and can call an OpenAI model for a structured investigation. It distinguishes observed evidence from model hypotheses and states limitations rather than treating a dataset label as proof of successful compromise.
+The optional `attack_graph.agentic_investigator` module builds on the existing event table and GEXF graph. It correlates nearby events, retrieves graph-neighborhood evidence, optionally accepts a risk-assessment JSON record, and calls a local Ollama model by default for structured investigation. OpenAI's hosted API is an optional, explicitly selected alternative. The module distinguishes observed evidence from model hypotheses and states limitations rather than treating a dataset label as proof of successful compromise.
 
 Install the optional dependency:
 
@@ -26,12 +26,16 @@ Install the optional dependency:
 python -m pip install -r requirements-agentic.txt
 ```
 
-Set the API key only in your local terminal; never commit it to the repository:
+### Free local LLM (recommended)
+
+Install Ollama for Windows from https://ollama.com/download/windows. Then open PowerShell and download a small local model:
 
 ```powershell
-$env:OPENAI_API_KEY = "your-api-key"
-$env:OPENAI_MODEL = "gpt-4.1-mini"
+ollama pull qwen2.5:3b
+ollama list
 ```
+
+The model download is about 1.9 GB and requires disk space. Inference runs on your computer without an OpenAI API key or per-token API billing; speed depends on your computer's hardware. Keep Ollama running during investigation.
 
 Run an offline smoke test with an event ID that actually exists in your events file. To list IDs first, use `python -c "import pandas as pd; print(pd.read_csv('benchmark_graph_output/attack_events.csv')['event_id'].head(10).to_list())"`:
 
@@ -39,11 +43,13 @@ Run an offline smoke test with an event ID that actually exists in your events f
 python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --offline --output-dir "agentic_investigation_output"
 ```
 
-For live LLM investigation, omit `--offline`:
+For a live local LLM investigation, omit `--offline` and use the local Ollama provider:
 
 ```powershell
-python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --output-dir "agentic_investigation_output"
+python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --provider ollama --output-dir "agentic_investigation_output"
 ```
+
+OpenAI's hosted API is optional and may incur API charges. To choose it explicitly, set `OPENAI_API_KEY` locally (never commit it) and add `--provider openai` to the command.
 
 Optional risk assessment can later be attached with `--risk-json path/to/risk_assessment.json`. Outputs are `agentic_investigation_<EVENT_ID>.json` and `agentic_investigation_<EVENT_ID>.md`. Read [attack_graph/AGENTIC_INVESTIGATION.md](attack_graph/AGENTIC_INVESTIGATION.md) for details. Replace `EVT-00001` with an event ID actually present in `attack_events.csv`.
 
