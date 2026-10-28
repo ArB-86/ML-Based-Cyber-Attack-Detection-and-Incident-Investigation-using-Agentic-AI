@@ -74,6 +74,27 @@ def _event_record(events: pd.DataFrame, event_id: str) -> dict[str, Any]:
     return _json_safe(matches.iloc[0].to_dict())
 
 
+def _detector_context(target: dict[str, Any]) -> dict[str, Any]:
+    """Compute the pipeline's anomaly-threshold interpretation deterministically."""
+    raw_score = target.get("mean_anomaly_score")
+    try:
+        score = float(raw_score) if raw_score is not None and not pd.isna(raw_score) else None
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "score_field": "mean_anomaly_score",
+        "mean_anomaly_score": score,
+        "isolation_forest_threshold": ISOLATION_FOREST_THRESHOLD,
+        "pipeline_flagged_suspicious_by_threshold": (
+            score < ISOLATION_FOREST_THRESHOLD if score is not None else None
+        ),
+        "interpretation": (
+            "Isolation Forest decision_function scores lower than the threshold are flagged as suspicious. "
+            "This is an anomaly flag, not evidence that authentication succeeded or failed, and not a probability."
+        ),
+    }
+
+
 def retrieve_evidence(
     events: pd.DataFrame,
     target: dict[str, Any],
@@ -149,6 +170,7 @@ def _make_prompt(
     return json.dumps(
         {
             "target_event": target,
+            "detector_interpretation": _detector_context(target),
             "related_events_and_graph": evidence,
             "risk_assessment_if_available": risk_context,
             "analyst_requirements": [
@@ -357,9 +379,23 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         "",
         str(result.get("summary", "")),
         "",
-        "## Observed evidence",
+        "## Detector interpretation",
         "",
     ]
+    detector = payload.get("detector_interpretation", {})
+    score = detector.get("mean_anomaly_score")
+    threshold = detector.get("isolation_forest_threshold", ISOLATION_FOREST_THRESHOLD)
+    flagged = detector.get("pipeline_flagged_suspicious_by_threshold")
+    if score is not None:
+        flag_text = "flagged suspicious" if flagged else "not below threshold"
+        lines.append(
+            f"- Mean anomaly score: {score:.6f}; threshold: {threshold:.6f}; "
+            f"pipeline result: **{flag_text}**."
+        )
+    lines.append(
+        "- This detector result is an anomaly flag, not proof of successful or failed authentication."
+    )
+    lines.extend(["", "## Observed evidence", ""])
     lines.extend(f"- {x}" for x in result.get("observed_evidence", []))
     lines.extend(["", "## Hypotheses", ""])
     for hypothesis in result.get("hypotheses", []):
@@ -457,6 +493,7 @@ def run(
         "model": used_model,
         "event_id": str(event_id),
         "target_event": target,
+        "detector_interpretation": _detector_context(target),
         "evidence": evidence,
         "risk_context": risk_context,
         "investigation": investigation,
