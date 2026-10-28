@@ -416,17 +416,15 @@ def _ask_llm(
                 "Only the supplied event table and optional graph were examined.",
             ],
         }
-        for key in missing:
-            result[key] = fallback[key]
-
-        limitations = result.get("limitations", [])
-        if not isinstance(limitations, list):
-            limitations = [limitations] if limitations else []
-        limitations.append(
-            "The LLM response omitted required fields; evidence-grounded fallback "
-            "content was used for: " + ", ".join(recovered_fields) + "."
+        # Do not mix potentially unsupported text from a partial LLM response
+        # with deterministic fallback fields. If one repair attempt still leaves
+        # required keys missing, replace the entire report with grounded defaults.
+        fallback["limitations"].append(
+            "The LLM response remained incomplete after one repair attempt; "
+            "a deterministic evidence-grounded fallback was used for the full report. "
+            "Missing fields after repair: " + ", ".join(recovered_fields) + "."
         )
-        result["limitations"] = limitations
+        result = fallback
 
     # Small local models sometimes return a string where the schema requests
     # a list. Normalize it to one complete item instead of iterating characters
