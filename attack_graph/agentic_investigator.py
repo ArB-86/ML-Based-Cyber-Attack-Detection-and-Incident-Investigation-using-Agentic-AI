@@ -337,15 +337,10 @@ def _guard_unsupported_auth_outcome_claims(
     ]
 
     assertion = re.compile(
-        r"(?i)\\b(?:un?successful|succeeded|failed|failure|successfully compromised|"
-        r"did not succeed|didn't succeed|did not fail|didn't fail)\\b"
+        r"(?i)\b(?:(?:un)?successful(?:ly)?|succeeded|failed|failure|"
+        r"successfully compromised|did not succeed|didn't succeed|did not fail|didn't fail)\b"
     )
     outcome_unknown = "The authentication outcome is unknown from the supplied flow and graph evidence."
-
-    for field in ("summary", "risk_rationale"):
-        value = investigation.get(field)
-        if isinstance(value, str) and assertion.search(value):
-            investigation[field] = assertion.sub(outcome_unknown, value)
 
     hypotheses = investigation.get("hypotheses", [])
     if not isinstance(hypotheses, list):
