@@ -149,29 +149,58 @@ def _make_prompt(
     )
 
 
-def _ask_llm(prompt: str, model: str | None = None) -> dict[str, Any]:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. Set it locally, or use --offline for "
-            "a deterministic evidence-only report."
-        )
+def _ask_llm(
+    prompt: str,
+    model: str | None = None,
+    provider: str = "ollama",
+) -> dict[str, Any]:
+    """Call a local Ollama model by default, or OpenAI when explicitly selected."""
     try:
         from openai import OpenAI
     except ImportError as exc:
         raise RuntimeError(
-            "OpenAI SDK not installed. Run: python -m pip install -r requirements-agentic.txt"
+            "OpenAI-compatible client missing. Run: "
+            "python -m pip install -r requirements-agentic.txt"
         ) from exc
 
-    model_name = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    response = OpenAI().chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
+    provider = provider.strip().lower()
+    if provider == "ollama":
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        model_name = model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        client = OpenAI(base_url=base_url, api_key="ollama")
+    elif provider == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. To avoid API charges, use the default "
+                "local Ollama provider. For OpenAI, set the key locally and pass "
+                "--provider openai explicitly."
+            )
+        model_name = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    else:
+        raise ValueError(
+            f"Unsupported provider {provider!r}; choose 'ollama' or 'openai'."
+        )
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+    except Exception as exc:
+        if provider == "ollama":
+            raise RuntimeError(
+                "Could not call the local Ollama model. Confirm Ollama is installed "
+                "and running, then run ollama pull qwen2.5:3b. Default local API: "
+                f"{base_url}. Original error: {exc}"
+            ) from exc
+        raise
+
     body = response.choices[0].message.content
     if not body:
         raise RuntimeError("The model returned an empty response.")
@@ -319,6 +348,7 @@ def run(
     max_related: int = 15,
     offline: bool = False,
     model: str | None = None,
+    provider: str = "ollama",
 ) -> dict[str, Any]:
     events = load_events(events_path)
     target = _event_record(events, event_id)
@@ -352,11 +382,18 @@ def run(
         used_model = None
     else:
         investigation = _ask_llm(
-            _make_prompt(target, evidence, risk_context), model=model
+            _make_prompt(target, evidence, risk_context),
+            model=model,
+            provider=provider,
         )
         investigation["event_id"] = str(event_id)
-        mode = "openai_llm"
-        used_model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        mode = f"{provider}_llm"
+        if model:
+            used_model = model
+        elif provider == "ollama":
+            used_model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        else:
+            used_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
     payload = {
         "mode": mode,
@@ -377,7 +414,11 @@ def run(
     )
     _write_markdown(payload, md_path)
 
-    print("AGENTIC AI INVESTIGATION" if mode == "openai_llm" else "OFFLINE EVIDENCE SUMMARY")
+    print(
+        "LOCAL OLLAMA INVESTIGATION" if mode == "ollama_llm"
+        else "OPENAI API INVESTIGATION" if mode == "openai_llm"
+        else "OFFLINE EVIDENCE SUMMARY"
+    )
     print("=" * 54)
     print(f"Event ID : {event_id}")
     print(f"Mode     : {mode}")
@@ -397,7 +438,17 @@ def main() -> None:
     parser.add_argument("--output-dir", default="agentic_investigation_output")
     parser.add_argument("--window-seconds", type=int, default=300)
     parser.add_argument("--max-related", type=int, default=15)
-    parser.add_argument("--model", default=None, help="OpenAI model name; defaults to OPENAI_MODEL or gpt-4.1-mini")
+    parser.add_argument(
+        "--provider",
+        choices=["ollama", "openai"],
+        default="ollama",
+        help="LLM provider; defaults to local Ollama (no API billing). OpenAI is opt-in.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name; defaults to OLLAMA_MODEL/qwen2.5:3b or OPENAI_MODEL/gpt-4.1-mini.",
+    )
     parser.add_argument("--offline", action="store_true", help="Create evidence-only report without calling an LLM")
     args = parser.parse_args()
     run(
@@ -410,6 +461,7 @@ def main() -> None:
         max_related=args.max_related,
         offline=args.offline,
         model=args.model,
+        provider=args.provider,
     )
 
 
