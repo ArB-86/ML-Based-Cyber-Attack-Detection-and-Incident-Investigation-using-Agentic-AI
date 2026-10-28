@@ -250,18 +250,183 @@ def _ask_llm(
     body = response.choices[0].message.content
     if not body:
         raise RuntimeError("The model returned an empty response.")
-    try:
-        result = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("The model response was not valid JSON.") from exc
-
     required = {
         "event_id", "summary", "observed_evidence", "hypotheses",
         "timeline", "risk_rationale", "recommended_next_steps", "limitations",
     }
+    try:
+        result = json.loads(body)
+        if not isinstance(result, dict):
+            result = {}
+    except json.JSONDecodeError:
+        result = {}
+
+    # Small local models may occasionally return an incomplete JSON object.
+    # Retry once with an explicit schema-repair instruction before using
+    # evidence-grounded deterministic defaults for any fields still missing.
     missing = required - set(result)
     if missing:
-        raise RuntimeError(f"Model response is missing fields: {sorted(missing)}")
+        repair_prompt = (
+            "Your previous response was incomplete or malformed. Return one "
+            "complete valid JSON object with ALL required top-level keys: "
+            + ", ".join(sorted(required))
+            + ". Do not omit any key. Keep all claims grounded in the supplied "
+            "evidence and do not infer attack success or impact.\n\n"
+            + "Keys missing from the previous response: "
+            + ", ".join(sorted(missing))
+            + "\n\nPrevious response:\n"
+            + str(body)
+            + "\n\nOriginal evidence JSON:\n"
+            + prompt
+        )
+        try:
+            repair_response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            repaired_body = repair_response.choices[0].message.content
+            if repaired_body:
+                repaired_result = json.loads(repaired_body)
+                if isinstance(repaired_result, dict):
+                    result.update(repaired_result)
+        except Exception:
+            # Continue to deterministic fallback below if repair also fails.
+            pass
+
+    missing = required - set(result)
+    recovered_fields = sorted(missing)
+    if missing:
+        try:
+            prompt_data = json.loads(prompt)
+        except (TypeError, json.JSONDecodeError):
+            prompt_data = {}
+        target_event = prompt_data.get("target_event", {})
+        if not isinstance(target_event, dict):
+            target_event = {}
+
+        event_id = str(target_event.get("event_id") or "unknown")
+        attack_label = str(
+            target_event.get("attack_type") or target_event.get("label") or "unknown"
+        )
+        source_ip = target_event.get("src_ip")
+        destination_ip = target_event.get("dst_ip")
+        destination_port = target_event.get(
+            "dst_port", target_event.get("destination_port")
+        )
+        protocol = target_event.get("protocol")
+        flow_count = target_event.get("flow_count")
+        timestamp = target_event.get("start_time") or "unknown"
+        raw_score = target_event.get("mean_anomaly_score")
+        try:
+            score_value = (
+                float(raw_score)
+                if raw_score is not None and not pd.isna(raw_score)
+                else None
+            )
+        except (TypeError, ValueError):
+            score_value = None
+
+        facts = [f"Dataset label: {attack_label}."]
+        if source_ip is not None or destination_ip is not None:
+            facts.append(
+                f"Source {source_ip if source_ip is not None else 'unknown'} "
+                f"to destination {destination_ip if destination_ip is not None else 'unknown'}."
+            )
+        if destination_port is not None:
+            facts.append(f"Destination port: {destination_port}.")
+        if protocol is not None:
+            facts.append(f"Protocol: {protocol}.")
+        if flow_count is not None:
+            facts.append(
+                f"Flow count: {flow_count} grouped flow records, not packets or login attempts."
+            )
+        if score_value is not None:
+            threshold_result = (
+                "below threshold and flagged suspicious"
+                if score_value < ISOLATION_FOREST_THRESHOLD
+                else "not below threshold"
+            )
+            facts.append(
+                f"Mean Isolation Forest decision score: {score_value:.6f}; "
+                f"configured threshold: {ISOLATION_FOREST_THRESHOLD:.6f}; "
+                f"the score is {threshold_result}."
+            )
+
+        if score_value is None:
+            risk_rationale = (
+                "The supplied event record has no usable mean anomaly score. "
+                "The available label and graph evidence do not establish attack impact, "
+                "and no calibrated risk probability is calculated."
+            )
+        else:
+            comparison = (
+                "below"
+                if score_value < ISOLATION_FOREST_THRESHOLD
+                else "at or above"
+            )
+            risk_rationale = (
+                f"The mean Isolation Forest decision score ({score_value:.6f}) is "
+                f"{comparison} the configured threshold "
+                f"({ISOLATION_FOREST_THRESHOLD:.6f}). This is a detector threshold "
+                "assessment, not a calibrated risk probability or proof of compromise."
+            )
+
+        fallback = {
+            "event_id": event_id,
+            "summary": (
+                f"Evidence-based investigation for event {event_id} "
+                f"(dataset label: {attack_label}). The supplied flow and graph "
+                "evidence does not establish successful compromise or impact."
+            ),
+            "observed_evidence": facts,
+            "hypotheses": [{
+                "claim": (
+                    "The supplied data does not establish whether this event caused "
+                    "successful compromise or impact."
+                ),
+                "supporting_evidence": [
+                    "The dataset label identifies a traffic category but does not prove impact.",
+                    (
+                        f"The configured Isolation Forest threshold is "
+                        f"{ISOLATION_FOREST_THRESHOLD:.6f}; an anomaly score alone "
+                        "does not establish attack outcome."
+                    ),
+                ],
+                "confidence": "low",
+            }],
+            "timeline": [{
+                "time": str(timestamp),
+                "event": f"Event {event_id} labeled {attack_label}.",
+                "evidence": "Timestamp and label were read from the supplied event record.",
+            }],
+            "risk_rationale": risk_rationale,
+            "recommended_next_steps": [
+                "Validate the event against firewall, endpoint, and authentication logs.",
+                "Preserve relevant flow records and timestamps for analyst review.",
+                "Review available graph edges and correlated events before deciding on containment.",
+            ],
+            "limitations": [
+                "The dataset label and anomaly score do not prove compromise or successful impact.",
+                "Flow count is not a count of packets or authentication attempts.",
+                "Only the supplied event table and optional graph were examined.",
+            ],
+        }
+        for key in missing:
+            result[key] = fallback[key]
+
+        limitations = result.get("limitations", [])
+        if not isinstance(limitations, list):
+            limitations = [limitations] if limitations else []
+        limitations.append(
+            "The LLM response omitted required fields; evidence-grounded fallback "
+            "content was used for: " + ", ".join(recovered_fields) + "."
+        )
+        result["limitations"] = limitations
 
     # Small local models sometimes return a string where the schema requests
     # a list. Normalize it to one complete item instead of iterating characters
