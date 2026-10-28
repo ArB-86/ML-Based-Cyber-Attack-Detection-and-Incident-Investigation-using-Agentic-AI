@@ -308,7 +308,7 @@ def _ask_llm(
             return [fix_flow_count_wording(item) for item in value]
         if isinstance(value, str):
             return re.sub(
-                r"(?i)\\bflow[_ ]count\\s+(?:of|is|=|:)?\\s*(\\d+)\\s+packets?\\b",
+                r"(?i)\bflow[_ ]count\s+(?:of|is|=|:)?\s*(\d+)\s+packets?\b",
                 lambda match: f"flow_count of {match.group(1)} flows (not packets)",
                 value,
             )
