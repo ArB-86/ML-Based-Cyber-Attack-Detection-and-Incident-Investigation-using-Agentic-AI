@@ -13,9 +13,7 @@ investigator.
 - Reads predecessor/successor nodes and edge metadata for that event from
   `attack_graph.gexf`, when supplied.
 - Optionally attaches a risk-assessment record from a JSON file.
-- Calls an OpenAI model to return structured findings: summary, observed
-  evidence, hypotheses with evidence/confidence, timeline, risk rationale,
-  defensive next steps, and limitations.
+- Calls a local Ollama model by default, or OpenAI if explicitly selected, to return structured findings: summary, observed evidence, hypotheses with evidence/confidence, timeline, risk rationale, defensive next steps, and limitations.
 - Writes a JSON evidence bundle and a Markdown report.
 - Provides `--offline` mode for deterministic evidence summary/testing without
   an API call. Offline output is explicitly labelled as non-LLM output.
@@ -32,13 +30,31 @@ From the repository root, with the project's regular environment active:
 python -m pip install -r requirements-agentic.txt
 ```
 
-LLM mode requires an API key. Set it in the current PowerShell session; don't
-commit the key to the repository:
+## Free local LLM setup (recommended)
+
+Install Ollama for Windows from https://ollama.com/download/windows, then open a
+new PowerShell window and download a small local model:
+
+```powershell
+ollama pull qwen2.5:3b
+ollama list
+```
+
+The model download uses disk space (about 1.9 GB for this model); inference then
+runs locally and does not require an OpenAI API key or per-token API billing.
+Performance depends on your computer's RAM/CPU/GPU. Keep Ollama running before
+launching the investigator.
+
+## Optional OpenAI API
+
+OpenAI's hosted API is available only if you choose it and have API access. Keep
+the key in your local environment and never commit it:
 
 ```powershell
 $env:OPENAI_API_KEY = "your-api-key"
 $env:OPENAI_MODEL = "gpt-4.1-mini"
 ```
+Do not paste the key into chat or source code.
 
 ## Run an offline smoke test
 
@@ -51,7 +67,7 @@ python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_event
 ## Run the LLM investigation
 
 ```powershell
-python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --output-dir "agentic_investigation_output"
+python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --provider ollama --output-dir "agentic_investigation_output"
 ```
 
 If risk assessment is available later as JSON keyed by event ID, pass it with
@@ -60,6 +76,8 @@ If risk assessment is available later as JSON keyed by event ID, pass it with
 Outputs:
 - `agentic_investigation_<EVENT_ID>.json`
 - `agentic_investigation_<EVENT_ID>.md`
+
+To use the hosted OpenAI API instead, add `--provider openai` and set `OPENAI_API_KEY`. The default provider is local Ollama to avoid unexpected API charges.
 
 The model's hypotheses are analyst aids, not verified ground truth. Review the
 cited evidence before acting on any recommendation. Event IDs must exist in the
