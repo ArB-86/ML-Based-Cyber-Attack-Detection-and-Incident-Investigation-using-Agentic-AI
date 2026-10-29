@@ -346,8 +346,8 @@ def _ask_llm(
         from openai import OpenAI
     except ImportError as exc:
         raise RuntimeError(
-            "OpenAI-compatible client missing. Run: "
-            "python -m pip install -r requirements-agentic.txt"
+            "OpenAI-compatible client missing. Install the one optional package with: "
+            'python -m pip install "openai>=1.40.0"'
         ) from exc
 
     provider = provider.strip().lower()
