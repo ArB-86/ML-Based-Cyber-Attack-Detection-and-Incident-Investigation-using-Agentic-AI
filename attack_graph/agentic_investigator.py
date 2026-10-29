@@ -674,6 +674,14 @@ def _guard_unsupported_auth_outcome_claims(
                     "potential coordinated activity that requires validation",
                 ),
                 (
+                    r"(?i)\b(?:may|might|could) indicate a botnet attack\b",
+                    "does not independently establish a coordinated botnet attack",
+                ),
+                (
+                    r"(?i)\b(?:suggests?|indicates?) (?:a )?potential botnet attack\b",
+                    "requires further validation before classifying coordinated activity",
+                ),
+                (
                     r"(?i)\brelated botnet activity\b",
                     "related activity requiring validation",
                 ),
