@@ -615,6 +615,29 @@ def _guard_unsupported_auth_outcome_claims(
                 ),
             ]
 
+    # A CICIDS "Bot" label is a dataset classification, not independent proof
+    # that this event is part of a coordinated botnet. Keep that distinction explicit.
+    if label.strip().lower() == "bot":
+        botnet_assertion = re.compile(r"(?i)\b(?:botnet|part of a bot\s*net|coordinated bot)\b")
+        for hypothesis in hypotheses:
+            if not isinstance(hypothesis, dict):
+                continue
+            claim = str(hypothesis.get("claim", ""))
+            if botnet_assertion.search(claim):
+                hypothesis["claim"] = (
+                    "The event is labeled Bot in the CICIDS dataset; the supplied evidence "
+                    "does not independently establish coordinated botnet activity or impact."
+                )
+                hypothesis["confidence"] = "low"
+                hypothesis["supporting_evidence"] = [
+                    "The CICIDS dataset label is Bot; the label identifies a traffic category but does not by itself prove coordinated activity.",
+                    (
+                        f"The target event records source {target.get('src_ip', 'unknown')} "
+                        f"and destination {target.get('dst_ip', 'unknown')}. "
+                        "A shared destination alone does not establish a coordinated botnet."
+                    ),
+                ]
+
     return investigation
 
 
