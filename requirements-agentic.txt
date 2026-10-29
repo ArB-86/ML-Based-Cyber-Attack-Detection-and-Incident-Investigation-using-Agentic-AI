@@ -1,3 +1,0 @@
-# Optional dependency for the Agentic Investigation module.
-# pandas and networkx are already used by the existing attack-graph pipeline.
-openai>=1.40.0
