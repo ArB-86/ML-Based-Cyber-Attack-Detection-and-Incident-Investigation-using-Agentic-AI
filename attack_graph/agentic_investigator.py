@@ -654,6 +654,18 @@ def _guard_unsupported_auth_outcome_claims(
 
             replacements = [
                 (
+                    r"(?i)\bsuggesting potential coordinated bot activity\b",
+                    "which requires validation; a shared destination does not establish coordination",
+                ),
+                (
+                    r"(?i)\bwhich could indicate a coordinated botnet attack\b",
+                    "but a shared destination alone does not establish a coordinated attack",
+                ),
+                (
+                    r"(?i)\b(?:was |is |has been )?classified as a bot attack\b",
+                    "labeled Bot in the CICIDS dataset",
+                ),
+                (
                     r"(?i)\ban event with a suspicious Isolation Forest score,?\s*indicating potential bot activity\b",
                     "an event flagged as suspicious by Isolation Forest; the CICIDS dataset label is Bot, but coordinated botnet activity is not established",
                 ),
