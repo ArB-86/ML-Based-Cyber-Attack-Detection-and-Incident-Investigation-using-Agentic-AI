@@ -590,6 +590,31 @@ def _guard_unsupported_auth_outcome_claims(
             hypothesis["confidence"] = "low"
             hypothesis["supporting_evidence"] = evidence_text.copy()
 
+    # A DoS Hulk dataset label and repeated events against one destination do
+    # not establish a distributed attack. Require explicit multi-source evidence
+    # before allowing the LLM to label an incident as DDoS.
+    ddos_assertion = re.compile(
+        r"(?i)\b(?:distributed denial[- ]of[- ]service|DDoS)\b"
+    )
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        claim = str(hypothesis.get("claim", ""))
+        if ddos_assertion.search(claim):
+            hypothesis["claim"] = (
+                "The event may represent repeated DoS Hulk-labeled activity, "
+                "but the supplied evidence does not establish a distributed attack."
+            )
+            hypothesis["confidence"] = "low"
+            hypothesis["supporting_evidence"] = [
+                f"The dataset label is {label!r}; a dataset label alone does not establish attack structure.",
+                (
+                    f"The target event records source {target.get('src_ip', 'unknown')} "
+                    f"and destination {target.get('dst_ip', 'unknown')}. "
+                    "Evidence of traffic from multiple independent sources was not established by this event alone."
+                ),
+            ]
+
     return investigation
 
 
