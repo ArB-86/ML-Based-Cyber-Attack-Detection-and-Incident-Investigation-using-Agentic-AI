@@ -724,6 +724,63 @@ def _guard_unsupported_auth_outcome_claims(
 
         investigation = soften_botnet_claims(investigation)
 
+        # Use grounded language for the primary report fields so model phrasing
+        # cannot reintroduce an unsupported botnet/coordinated-attack conclusion.
+        event_id = str(target.get("event_id", "unknown"))
+        score_text = (
+            f"{float(score):.6f}"
+            if score is not None and not pd.isna(score)
+            else "unavailable"
+        )
+        investigation["summary"] = (
+            f"Event {event_id} is labeled Bot in the CICIDS dataset and was "
+            f"{'flagged suspicious' if score is not None and not pd.isna(score) and float(score) < ISOLATION_FOREST_THRESHOLD else 'reviewed'} "
+            f"by the Isolation Forest (mean decision score: {score_text}; "
+            f"threshold: {ISOLATION_FOREST_THRESHOLD:.6f}). The dataset label "
+            "and anomaly flag do not independently establish coordinated botnet activity or impact."
+        )
+
+        observed = investigation.get("observed_evidence", [])
+        if not isinstance(observed, list):
+            observed = [observed] if observed else []
+        safe_observed = []
+        label_statement = (
+            "CICIDS dataset label: Bot. This is a dataset traffic classification, "
+            "not independent proof of coordinated botnet activity."
+        )
+        for item in observed:
+            item_text = str(item)
+            if re.search(r"(?i)\b(?:botnet|bot attack|bot activity|classified as a bot)\b", item_text):
+                continue
+            safe_observed.append(item_text)
+        safe_observed.insert(0, label_statement)
+        investigation["observed_evidence"] = safe_observed
+
+        investigation["risk_rationale"] = (
+            f"The mean Isolation Forest decision score is {score_text}; the configured "
+            f"threshold is {ISOLATION_FOREST_THRESHOLD:.6f}. "
+            + (
+                "The score is below threshold, so the pipeline flags this event as suspicious. "
+                if score is not None and not pd.isna(score) and float(score) < ISOLATION_FOREST_THRESHOLD
+                else "The available score does not meet the configured suspicious threshold. "
+                if score is not None and not pd.isna(score)
+                else "No usable Isolation Forest score was supplied. "
+            )
+            + "This anomaly flag and the CICIDS Bot label do not establish coordinated botnet activity or operational impact."
+        )
+
+        recommendations = investigation.get("recommended_next_steps", [])
+        if not isinstance(recommendations, list):
+            recommendations = [recommendations] if recommendations else []
+        investigation["recommended_next_steps"] = [
+            (
+                "Validate the related flow records, source/destination context, and relevant logs before deciding whether segmentation or containment is warranted."
+                if re.search(r"(?i)\b(?:botnet|coordinated (?:bot|attack|activity)|limit the spread)\b", str(item))
+                else str(item)
+            )
+            for item in recommendations
+        ]
+
     return investigation
 
 
