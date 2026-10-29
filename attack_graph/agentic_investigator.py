@@ -638,6 +638,52 @@ def _guard_unsupported_auth_outcome_claims(
                     ),
                 ]
 
+    if label.strip().lower() == "bot":
+        # Sanitize all report sections, not only hypotheses: local models may
+        # repeat an unsupported botnet claim in the summary, evidence, or risk rationale.
+        def soften_botnet_claims(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: soften_botnet_claims(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [soften_botnet_claims(item) for item in value]
+            if not isinstance(value, str):
+                return value
+
+            replacements = [
+                (
+                    r"(?i)\ban event with a suspicious Isolation Forest score and related botnet activity\b",
+                    "an event with a suspicious Isolation Forest score and related events requiring validation",
+                ),
+                (
+                    r"(?i)\bthe event is part of a botnet attack, as indicated by the ['\"“]?Bot['\"”]? attack type\b",
+                    "the event is labeled Bot in the CICIDS dataset; this label alone does not establish coordinated botnet activity",
+                ),
+                (
+                    r"(?i)\bother botnet-related events\b",
+                    "other related events",
+                ),
+                (
+                    r"(?i)\bshares characteristics with other botnet-related events\b",
+                    "shares a destination IP with other related events",
+                ),
+                (
+                    r"(?i)\bpotential botnet activity\b",
+                    "potential coordinated activity that requires validation",
+                ),
+                (
+                    r"(?i)\brelated botnet activity\b",
+                    "related activity requiring validation",
+                ),
+            ]
+            for pattern, replacement in replacements:
+                value = re.sub(pattern, replacement, value)
+            return value
+
+        investigation = soften_botnet_claims(investigation)
+
     return investigation
 
 
