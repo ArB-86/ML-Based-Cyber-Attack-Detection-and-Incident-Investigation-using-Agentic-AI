@@ -662,6 +662,14 @@ def _guard_unsupported_auth_outcome_claims(
                     "the event is labeled Bot in the CICIDS dataset; this label alone does not establish coordinated botnet activity",
                 ),
                 (
+                    r"(?i)\bthe event is (?:classified|identified|described) as (?:a )?botnet activity\b",
+                    "the event is labeled Bot in the CICIDS dataset; this label alone does not establish coordinated botnet activity",
+                ),
+                (
+                    r"(?i)\b(?:potential|possible|suspected) botnet attacks?\b",
+                    "potential malicious activity requiring validation",
+                ),
+                (
                     r"(?i)\bother botnet-related events\b",
                     "other related events",
                 ),
