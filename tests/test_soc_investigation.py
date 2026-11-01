@@ -100,3 +100,76 @@ def test_graph_links_shared_target_and_host_pivot_for_soc_chain(tmp_path):
     assert "T1110" in report
     assert "pivot hosts" in report
     assert payload["incidents"][0]["graph_analysis"]["pivot_hosts"] == ["B"]
+
+
+def test_incident_graph_and_agent_tools_share_one_incident_id(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 22, "alert": True,
+            "detection_reasons": "BRUTE_FORCE_PATTERN", "alert_sources": "BEHAVIOURAL_RULE",
+            "anomaly_score": 0.01,
+        },
+        {
+            "timestamp": _time(1), "src_ip": "B", "dst_ip": "C", "protocol": 6,
+            "src_port": 22, "dst_port": 445, "alert": True,
+            "detection_reasons": "HIGH_SOURCE_FANOUT", "alert_sources": "BEHAVIOURAL_RULE",
+            "anomaly_score": 0.02,
+        },
+    ])
+    events, graph, summary = run_soc_investigation(flows, tmp_path)
+    incident_nodes = [
+        (node, attrs) for node, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "incident"
+    ]
+    assert len(incident_nodes) == 1
+
+    incident_id = incident_nodes[0][1]["label"]
+    assert graph.has_edge(f"incident:{incident_id}", "event:EVT-000001")
+    assert graph.has_edge(f"incident:{incident_id}", "event:EVT-000002")
+
+    payload = json.loads((tmp_path / "incident_investigation.json").read_text())
+    dossier = payload["incidents"][0]
+    assert dossier["incident_id"] == incident_id
+    agent = dossier["investigation_agent"]
+    assert agent["status"] == "completed"
+    assert {call["tool"] for call in agent["tool_calls"]} == {
+        "get_incident", "get_timeline", "get_graph_neighborhood", "get_detection_evidence"
+    }
+    assert agent["findings"]
+    for finding in agent["findings"]:
+        assert set(finding["evidence_event_ids"]).issubset(set(dossier["event_ids"]))
+
+    manifest = json.loads((tmp_path / "soc_pipeline_manifest.json").read_text())
+    assert manifest["counts"]["alerts"] == len(flows)
+    assert manifest["counts"]["events"] == len(events)
+    assert manifest["counts"]["incidents"] == 1
+    assert manifest["counts"]["agent_tool_calls"] == 4
+    assert (tmp_path / "event_correlations.csv").exists()
+    assert (tmp_path / "attack_graph.gexf").exists()
+
+
+def test_legacy_investigator_cli_reuses_canonical_workflow(tmp_path):
+    from attack_graph.incident_investigator import run as run_legacy_investigator
+
+    legacy_events = pd.DataFrame([{
+        "event_id": "OLD-1",
+        "start_time": _time(0),
+        "end_time": _time(0, 5),
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.2",
+        "protocol": 6,
+        "attack_type": "PortScan",
+        "flow_count": 12,
+        "mean_anomaly_score": 0.1,
+        "ports_observed": "[(40000, 22), (40001, 80)]",
+    }])
+    source = tmp_path / "legacy_events.csv"
+    output = tmp_path / "canonical_output"
+    legacy_events.to_csv(source, index=False)
+
+    run_legacy_investigator(str(source), str(output))
+    payload = json.loads((output / "incident_investigation.json").read_text())
+    assert payload["ground_truth_labels_used"] is False
+    assert payload["incidents"][0]["detection_reasons"] == ["LEGACY_EVENT_IMPORT"]
+    assert payload["incidents"][0]["investigation_agent"]["tool_calls"]
