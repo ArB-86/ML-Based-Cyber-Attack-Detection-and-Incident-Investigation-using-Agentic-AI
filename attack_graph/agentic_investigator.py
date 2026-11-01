@@ -1108,7 +1108,6 @@ def _compact_graph_analysis(overview: dict[str, Any]) -> dict[str, Any]:
             "paths": paths.get("paths", [])[:8],
             "interpretation": paths.get("interpretation"),
         },
-        "soc_assessment": overview.get("soc_assessment", {}),
     }
 
 
