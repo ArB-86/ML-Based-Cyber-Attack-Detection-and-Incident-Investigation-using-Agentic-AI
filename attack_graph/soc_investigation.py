@@ -1318,6 +1318,14 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
         lines.append("No alert events were supplied. This is not proof of benign traffic; verify ingestion, detector coverage and model health.")
     for item in incidents[:15]:
         g, triage = item["graph_analysis"], item["triage"]
+        risk_breakdown = ", ".join(
+            f"{name}={detail.get('contribution_points', 0.0):.1f}"
+            for name, detail in triage.get("components", {}).items()
+        ) or "not available"
+        relation_breakdown = ", ".join(
+            f"{name}={count}"
+            for name, count in g.get("edge_relation_counts", {}).items()
+        ) or "no correlated edges"
         lines.extend([
             f"### {item['incident_id']} — {item['title']}", "",
             f"**Severity:** {triage['severity']}  ",
@@ -1327,8 +1335,8 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             f"**Observed scope:** {len(item['event_ids'])} events, {item['total_flows']:,} flows, {g['unique_sources']} sources and {g['unique_targets']} destinations.",
             f"**Detection evidence:** {', '.join(item['detection_reasons']) or 'No behavioural rule token'}.",
             f"**Graph structure:** {g['graph_event_links']} event-to-event links, density {g.get('graph_density', 0.0):.4f}, {g['unique_services']} destination services, pivot hosts: {', '.join(g['pivot_hosts']) or 'none observed'}.",
-            f"**Graph relationship types:** {', '.join(f'{name}={count}' for name, count in g.get('edge_relation_counts', {}).items()) or 'no correlated edges'}.",
-            f"**Risk score components:** {', '.join(f'{name}={detail['contribution_points']:.1f}' for name, detail in triage.get('components', {}).items()) or 'not available'}.", "",
+            f"**Graph relationship types:** {relation_breakdown}.",
+            f"**Risk score component contributions:** {risk_breakdown}.", "",
             "**Top central events:**",
         ])
         for central in g.get("top_central_events", [])[:5]:
