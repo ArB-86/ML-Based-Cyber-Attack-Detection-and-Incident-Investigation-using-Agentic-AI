@@ -50,60 +50,18 @@ def write_attack_graph_gexf(graph: nx.DiGraph, path: str) -> None:
     nx.write_gexf(_sanitize_graph_for_gexf(graph), path)
 
 
-def build_attack_graph(events: pd.DataFrame) -> nx.DiGraph:
-    """Build an entity/event graph from a metadata-rich event table."""
-    required = {
-        "event_id", "src_ip", "dst_ip", "attack_type", "protocol",
-        "start_time", "end_time", "flow_count",
-    }
-    missing = required - set(events.columns)
-    if missing:
-        raise ValueError(f"Missing event columns: {sorted(missing)}")
+def build_attack_graph(
+    events: pd.DataFrame,
+    correlations: pd.DataFrame | None = None,
+) -> nx.DiGraph:
+    """Compatibility adapter to the canonical SOC attack-graph constructor.
 
-    graph = nx.DiGraph()
+    Event correlation is owned by EventCorrelationAgent in soc_investigation;
+    this module must not maintain a second graph schema or edge algorithm.
+    """
+    from .soc_investigation import build_soc_graph
 
-    for _, event in events.iterrows():
-        src = f"host:{event['src_ip']}"
-        dst = f"host:{event['dst_ip']}"
-        attack = f"attack:{event['attack_type']}"
-        event_node = f"event:{event['event_id']}"
-
-        graph.add_node(src, node_type="source", label=str(event["src_ip"]))
-        graph.add_node(dst, node_type="target", label=str(event["dst_ip"]))
-        graph.add_node(
-            attack,
-            node_type="attack_type",
-            label=str(event["attack_type"]),
-        )
-        graph.add_node(
-            event_node,
-            node_type="event",
-            label=str(event["event_id"]),
-            protocol=str(event["protocol"]),
-            start_time=_gexf_safe(event["start_time"]),
-            end_time=_gexf_safe(event["end_time"]),
-            flow_count=int(event["flow_count"]),
-            mean_anomaly_score=_gexf_safe(event.get("mean_anomaly_score")),
-        )
-
-        graph.add_edge(src, event_node, relation="initiates")
-        graph.add_edge(event_node, attack, relation="classified_as")
-        graph.add_edge(event_node, dst, relation="targets")
-
-        if "incident_id" in event and pd.notna(event["incident_id"]):
-            incident_node = f"incident:{event['incident_id']}"
-            graph.add_node(
-                incident_node,
-                node_type="incident",
-                label=str(event["incident_id"]),
-            )
-            graph.add_edge(
-                incident_node,
-                event_node,
-                relation="contains",
-            )
-
-    return graph
+    return build_soc_graph(events, correlations=correlations)
 
 
 def add_sequence_edges(
@@ -114,46 +72,67 @@ def add_sequence_edges(
     require_shared_source: bool = True,
     require_shared_target: bool = True,
 ) -> nx.DiGraph:
-    """Add temporal edges only between consecutive related events."""
+    """Compatibility adapter that applies canonical event-correlation edges.
 
+    The shared-source/shared-target switches retain the historical API. When
+    both are true, only event pairs with both relationships are added. The
+    canonical pipeline does not call this adapter; it passes the full
+    correlation table directly into build_attack_graph.
+    """
     if events.empty:
         return graph
+    from .soc_investigation import EventCorrelationAgent
 
-    work = events.copy()
-    work["start_time"] = pd.to_datetime(
-        work["start_time"], errors="coerce", utc=True
-    )
-    work["end_time"] = pd.to_datetime(
-        work["end_time"], errors="coerce", utc=True
-    )
+    correlations = EventCorrelationAgent(
+        events,
+        max_gap_seconds=max_gap_seconds,
+    ).correlate()
+    pair_relations: dict[tuple[str, str], list[dict]] = {}
+    for _, row in correlations.iterrows():
+        pair = (str(row["from_event"]), str(row["to_event"]))
+        pair_relations.setdefault(pair, []).append(row.to_dict())
 
-    if work[["start_time", "end_time"]].isna().any().any():
-        raise ValueError("Sequence edges require valid event timestamps.")
-
-    work = work.sort_values("start_time").reset_index(drop=True)
-
-    for i in range(len(work) - 1):
-        left = work.iloc[i]
-        right = work.iloc[i + 1]
-
-        gap = (right["start_time"] - left["end_time"]).total_seconds()
-
-        shared_source = left["src_ip"] == right["src_ip"]
-        shared_target = left["dst_ip"] == right["dst_ip"]
-
-        related = (
-            gap >= 0
-            and gap <= max_gap_seconds
-            and (shared_source if require_shared_source else True)
-            and (shared_target if require_shared_target else True)
-        )
-
-        if related and left["event_id"] != right["event_id"]:
-            graph.add_edge(
-                f"event:{left['event_id']}",
-                f"event:{right['event_id']}",
-                relation="precedes",
-                gap_seconds=float(gap),
+    for (source_id, target_id), rows in pair_relations.items():
+        relations = {str(row["relation"]) for row in rows}
+        has_source = "same_source_temporal" in relations
+        has_target = "same_target_temporal" in relations
+        if require_shared_source and not has_source:
+            continue
+        if require_shared_target and not has_target:
+            continue
+        source = f"event:{source_id}"
+        target = f"event:{target_id}"
+        if source not in graph or target not in graph:
+            raise ValueError(
+                f"Graph is missing event nodes required by correlation: {source}, {target}"
             )
-
+        for row in rows:
+            relation = str(row["relation"])
+            attrs = {
+                key: row.get(key)
+                for key in (
+                    "gap_seconds",
+                    "overlap_seconds",
+                    "shared_entity",
+                    "pivot_host",
+                )
+                if row.get(key) is not None and not pd.isna(row.get(key))
+            }
+            if graph.has_edge(source, target):
+                existing = set(
+                    str(graph[source][target].get("relations", "")).split("|")
+                )
+                existing.add(relation)
+                graph[source][target]["relations"] = "|".join(sorted(x for x in existing if x))
+                graph[source][target]["relation"] = graph[source][target]["relations"]
+                for key, value in attrs.items():
+                    graph[source][target].setdefault(key, value)
+            else:
+                graph.add_edge(
+                    source,
+                    target,
+                    relation=relation,
+                    relations=relation,
+                    **attrs,
+                )
     return graph
