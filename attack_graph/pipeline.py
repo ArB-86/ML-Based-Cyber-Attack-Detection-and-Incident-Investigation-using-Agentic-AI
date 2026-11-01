@@ -27,9 +27,11 @@ def run_pipeline(config: PipelineConfig) -> None:
     investigation. No second model or parallel investigation path is started.
     """
     data_path = Path(config.data_dir)
-    if not data_path.exists():
+    if config.verify_only and not config.benchmark_parquet:
+        raise ValueError("--verify-only requires --benchmark-parquet.")
+    if not config.verify_only and not data_path.exists():
         raise FileNotFoundError(f"Dataset directory does not exist: {data_path}")
-    if not data_path.is_dir() and not config.verify_only:
+    if not config.verify_only and not data_path.is_dir():
         raise NotADirectoryError(f"Dataset path must be a directory: {data_path}")
     _run_dataset_pipeline(
         data_dir=str(data_path),
