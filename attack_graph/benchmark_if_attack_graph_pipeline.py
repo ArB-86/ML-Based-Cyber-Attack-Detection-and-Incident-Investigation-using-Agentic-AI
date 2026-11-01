@@ -628,6 +628,14 @@ def run(
         )
     train_benign_idx = train_benign_frame["_row_idx"].to_numpy()
 
+    # Leakage-safe metadata preprocessing: fit imputation statistics only on
+    # training rows and reuse them for validation, test and inference rows.
+    train_medians = x.iloc[train_idx].median(numeric_only=True)
+    train_medians = train_medians.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x = x.fillna(train_medians).fillna(0.0)
+    for feature in BENCHMARK_FEATURES:
+        df[feature] = x[feature]
+
     print(f"Train rows     : {len(train_idx):,}")
     print(f"Validation rows: {len(val_idx):,}")
     print(f"Test rows      : {len(test_idx):,}")
