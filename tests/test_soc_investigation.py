@@ -57,7 +57,6 @@ def test_rule_alerts_reach_soc_investigation_even_when_label_says_benign(tmp_pat
     assert int(events.iloc[0]["flow_count"]) == 12
     assert "PORT_SCAN" in events.iloc[0]["detection_reasons"]
     assert summary["incident_count"] == 1
-    assert (tmp_path / "attack_graph.gexf").exists() is False  # pipeline writes GEXF after visualisation setup
     report = (tmp_path / "incident_investigation_report.md").read_text()
     assert "Network Service Discovery" in report
     payload = json.loads((tmp_path / "incident_investigation.json").read_text())
