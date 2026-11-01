@@ -59,8 +59,8 @@ To run only the historical benchmark verifier:
 | ML detection | 69-feature flow matrix | Isolation Forest anomaly score and model alert provenance |
 | Behaviour detection | Timestamp, endpoints, ports, protocol and flow metadata | Explainable scan, fan-out, DDoS-pattern and authentication-service rule signals |
 | Alert fusion | Model and behavioural outputs | One alert decision per flow; `alert_sources` and `detection_reasons` |
-| Event correlation | Alert flows | Events grouped by endpoint pair/protocol/time; graph relations record shared source, target, service and host pivots |
-| Incident formation | Correlated event graph | Connected candidate incident groups with stable incident IDs in the run |
+| Event correlation | Alert flows | Events grouped by endpoint pair/protocol/time; typed source, target, service and host-pivot relations retained with timestamps |
+| Incident formation | Correlated event graph | Bounded candidate groups using only short same-source / directional host-pivot edges; unassigned events remain outside incidents |
 | Attack graph | Events and correlation relations | Typed host, event, service, detection and incident nodes; incident-to-event membership edges |
 | Risk assessment | Incident event set and graph metrics | Transparent priority score, severity and confidence; score is not a compromise probability |
 | Investigation agent | Incident dossier plus read-only tools | Incident, event timeline, graph neighbourhood and detection-provenance retrieval; tool trace and evidence-linked findings |
@@ -84,11 +84,11 @@ This is a provisional CICIDS2017 benchmark policy, not a production-calibrated r
 
 ### Correlation and incident formation
 
-Event correlation is a distinct stage implemented by `EventCorrelationAgent`. It emits an inspectable relationship table before incident formation, linking events independently by shared source, shared destination, shared destination service and target-to-source host pivots. `IncidentFormationAgent` consumes this table and groups connected event components into candidate incidents. Only then is the incident-linked attack graph assembled, with a first-class incident node and `contains` edges to member events. The exact edge types, shared entities, time gaps and overlaps are retained in `event_correlations.csv`.
+Event correlation is a distinct stage implemented by `EventCorrelationAgent`. It emits an inspectable relationship table before incident formation, recording shared-source, shared-target, shared-service and directional target-to-source host-pivot relationships. These edge types are not treated as equally strong evidence. `IncidentFormationAgent` can join events only through `same_source_temporal` edges with a maximum 60-second gap or `host_pivot` edges with a maximum 120-second gap. Candidate campaigns are bounded to a 900-second total time span. Same-target and same-service edges remain contextual graph relationships and never merge incidents by themselves. Isolated Isolation Forest anomalies and review-only events are not promoted as incidents; standalone `BRUTE_FORCE_PATTERN` candidates and imported legacy records are retained for analyst review. Consequently, some events intentionally remain unassigned to any incident. The full graph and `event_correlations.csv` retain contextual relationships for analyst inspection.
 
 ### Risk assessment
 
-The priority score combines detection-rule diversity, event persistence, source fan-out, destination convergence, service diversity and relative anomaly rank only when Isolation Forest actually fired for that incident. Severity is derived from the heuristic score. Confidence reflects independent evidence types and event support. Neither is a calibrated probability of compromise.
+The priority score combines detection-rule diversity, event persistence, source fan-out, destination convergence, service diversity and relative anomaly rank only when Isolation Forest actually fired for that incident. It is an analyst-workload ranking, not a probability of compromise. Severity is provisional and is capped at MEDIUM without at least two distinct out-of-band telemetry categories. HIGH confidence likewise requires at least two distinct out-of-band telemetry categories; a network-flow-only anomaly cluster is LOW confidence, while a high-specificity brute-force flow candidate is MEDIUM confidence until authentication outcomes are corroborated. The current CICIDS2017 flow-only input has no independent endpoint/identity/application telemetry, so it cannot justify HIGH confidence or HIGH/CRITICAL severity.
 
 ### Tool-driven investigation
 
