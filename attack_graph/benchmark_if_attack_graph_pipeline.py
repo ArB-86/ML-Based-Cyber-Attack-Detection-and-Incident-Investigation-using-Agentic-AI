@@ -722,10 +722,13 @@ def run(
     split[test_idx] = "test"
     df["split"] = split
 
+    df = merge_detector_outputs(df, anomaly_threshold=active_threshold)
     predictions_path = out / "cicids_if_predictions_with_metadata.csv"
     df.to_csv(predictions_path, index=False)
 
-    suspicious = df[df["predicted_anomaly"] & (df["label"].str.lower() != "benign")].copy()
+    # Do not intersect with Label != Benign. Doing so hides false positives
+    # and leaks benchmark ground truth into the operational investigation.
+    suspicious = df[df["alert"]].copy()
     suspicious_path = out / "suspicious_flows_with_metadata.csv"
     suspicious.to_csv(suspicious_path, index=False)
 
