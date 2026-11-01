@@ -1754,257 +1754,301 @@ def _guard_unsupported_auth_outcome_claims(
 def _offline_result(
     target: dict[str, Any], evidence: dict[str, Any]
 ) -> dict[str, Any]:
-    anomaly = target.get("mean_anomaly_score")
+    """Build deterministic graph-first analyst findings without calling an LLM."""
+    assessment = evidence.get("graph_analysis", {}).get("soc_assessment", {})
+    temporal = assessment.get("temporal_sequence", [])
+    observed = list(assessment.get("key_findings", []))
     triage = target.get("triage_score")
-    related = evidence["related_events"]
-    graph = evidence["graph_context"]
-    observations = [
-        f"Dataset label: {target.get('attack_type')}.",
-        f"Source {target.get('src_ip')} to destination {target.get('dst_ip')}; protocol {target.get('protocol')}.",
-        f"Flow count: {target.get('flow_count')}.",
-        f"Nearby related events retrieved: {len(related)}.",
-        (
-            f"Graph neighborhood available with {len(graph.get('predecessors', []))} "
-            f"predecessors and {len(graph.get('successors', []))} successors."
-            if graph else "Graph neighborhood was not available for this event."
-        ),
-    ]
-    if anomaly is not None:
-        observations.append(
-            f"Mean Isolation Forest decision score: {anomaly}; lower scores are more anomalous in this pipeline."
-        )
     if triage is not None:
-        observations.append(
-            f"Existing triage score: {triage}; this is a heuristic priority score, not a probability."
+        observed.append(
+            f"Existing heuristic triage score: {triage}; secondary prioritisation context only, not a probability or impact measure."
         )
+
+    timeline = [
+        {
+            "time": str(item.get("start_time") or "unknown"),
+            "event": (
+                f"{item.get('event_id')} — {item.get('attack_type')} "
+                f"({item.get('src_ip')} -> {item.get('dst_ip')})"
+            ),
+            "evidence": (
+                "Included in the explicit 'precedes' subgraph around the selected event; "
+                "only directed precedes edges support ordering."
+            ),
+        }
+        for item in temporal
+    ]
+    if not timeline:
+        timeline = [{
+            "time": str(target.get("start_time") or "unknown"),
+            "event": (
+                f"Selected event {target.get('event_id')} is labelled "
+                f"{target.get('attack_type')} in attack_events.csv."
+            ),
+            "evidence": (
+                "The selected event node exists, but no connected explicit temporal sequence "
+                "was established from 'precedes' edges."
+            ),
+        }]
+
     return {
         "event_id": str(target["event_id"]),
-        "summary": (
-            f"Offline evidence summary for {target['event_id']}. The dataset labels "
-            f"the event as {target.get('attack_type')}; this label alone does not prove impact."
+        "summary": assessment.get(
+            "executive_assessment",
+            f"Graph evidence for {target['event_id']} is available, but no event-specific assessment could be derived.",
         ),
-        "observed_evidence": observations,
-        "hypotheses": [
-            {
-                "claim": (
-                    "This event may belong to a broader sequence of activity."
-                    if related else
-                    "The supplied data does not establish a multi-event incident."
-                ),
-                "supporting_evidence": [
-                    f"{len(related)} nearby event(s) matched the configured correlation rule."
-                ],
-                "confidence": "low",
-            }
-        ],
-        "timeline": [
-            {
-                "time": str(target.get("start_time")),
-                "event": f"Event {target['event_id']} labeled {target.get('attack_type')}",
-                "evidence": "Timestamp and label from attack_events.csv.",
-            }
-        ],
+        "observed_evidence": observed,
+        "hypotheses": assessment.get("hypotheses", []),
+        "timeline": timeline,
         "risk_rationale": (
-            f"Existing triage score is {triage!r}; no calibrated risk probability "
-            "is calculated by this module."
+            f"Graph-pattern confidence: {assessment.get('graph_pattern_confidence', 'not established')} "
+            f"Operational impact: {assessment.get('impact_status', 'unknown')}"
         ),
-        "recommended_next_steps": [
-            "Validate the alert against firewall, endpoint, and authentication logs.",
-            "Preserve relevant flow records and timestamps for analyst review.",
-            "Review correlated events and graph edges before deciding on containment.",
-        ],
+        "recommended_next_steps": assessment.get("recommended_investigations", [
+            "Correlate the selected event with raw network telemetry and relevant host/service logs."
+        ]),
         "limitations": [
-            "Offline mode is deterministic and does not call an LLM; it is not an agentic result.",
-            "Dataset labels do not prove compromise or successful impact.",
-            "Only the supplied event table and optional graph were examined.",
+            "Offline mode is deterministic and does not call the LLM; it validates graph evidence and report construction, not the agent's reasoning loop.",
+            "The graph schema represents hosts, event nodes, dataset attack categories and explicit precedes edges; it does not encode complete service or endpoint outcomes.",
+            "A shared host, attack-type node or transitive connected component does not prove one campaign.",
+            "The supplied network-flow evidence does not establish service disruption, authentication outcome, successful compromise or data impact.",
         ],
     }
 
 
+
 def _write_markdown(payload: dict[str, Any], path: Path) -> None:
-    result = payload["investigation"]
+    """Write a SOC-style report with graph findings as the primary analysis."""
+    result = payload.get("investigation", {})
+    target = payload.get("target_event", {})
+    graph_analysis = payload.get("graph_analysis", {})
+    assessment = graph_analysis.get("soc_assessment", {})
+    detector = payload.get("detector_interpretation", {})
+    agent_run = payload.get("agent_run", {})
+    event_id = str(payload.get("event_id", "unknown"))
+    selected_node = assessment.get("selected_event_node", f"event:{event_id}")
+
     lines = [
-        f"# Investigation: {payload['event_id']}",
+        f"# SOC Graph Investigation: {event_id}",
         "",
-        f"**Mode:** {payload['mode']}",
+        f"**Mode:** {payload.get('mode', 'unknown')}",
         "",
-        "## Summary",
+        "## 1. Executive SOC assessment",
         "",
-        str(result.get("summary", "")),
+        str(assessment.get("executive_assessment") or result.get("summary", "No assessment returned.")),
         "",
-        "## Detector interpretation",
+        f"- **Graph-pattern confidence:** {assessment.get('graph_pattern_confidence', 'Not established')}",
+        f"- **Operational impact:** {assessment.get('impact_status', 'Unknown')}",
+        f"- **Selected graph node:** \`{selected_node}\`",
+        "",
+        "## 2. Selected event and direct graph position",
+        "",
+        f"- **Event:** {event_id}",
+        f"- **Dataset label:** {target.get('attack_type', 'unknown')}",
+        f"- **Source:** \`host:{target.get('src_ip', 'unknown')}\`",
+        f"- **Destination:** \`host:{target.get('dst_ip', 'unknown')}\`",
+        f"- **Protocol / grouped flow records:** {target.get('protocol', 'unknown')} / {target.get('flow_count', 'unknown')}",
+        "",
+        "Immediate edges show how the selected event is represented in the existing graph:",
         "",
     ]
-    detector = payload.get("detector_interpretation", {})
+
+    relations = assessment.get("selected_event_relations", {})
+    for item in relations.get("incoming", []):
+        lines.append(
+            f"- Incoming: \`{item.get('source')}\` --**{item.get('relation')}**--> \`{selected_node}\`"
+        )
+    for item in relations.get("outgoing", []):
+        lines.append(
+            f"- Outgoing: \`{selected_node}\` --**{item.get('relation')}**--> \`{item.get('target')}\`"
+        )
+    if not relations.get("incoming") and not relations.get("outgoing"):
+        lines.append("- No direct graph edges were returned for the selected event.")
+
+    lines.extend(["", "## 3. SOC findings derived from graph topology", ""])
+    for finding in assessment.get("key_findings", []):
+        lines.append(f"- {finding}")
+
+    source = assessment.get("source_host_profile", {})
+    destination = assessment.get("destination_host_profile", {})
+    lines.extend([
+        "",
+        "### Source-host investigation",
+        "",
+        f"- Node: \`host:{target.get('src_ip', 'unknown')}\`",
+        f"- Event nodes initiated: **{source.get('event_count', 0)}**",
+        f"- Distinct destination hosts: **{source.get('distinct_peer_host_count', 0)}**",
+        f"- Destination hosts observed: {', '.join(source.get('distinct_peer_hosts', [])) or 'none returned'}",
+        f"- Attack-label distribution: {source.get('attack_type_counts', {})}",
+        f"- Observed time range: {source.get('time_start', 'unknown')} to {source.get('time_end', 'unknown')}",
+    ])
+    if source.get("event_ids"):
+        suffix = " (truncated)" if source.get("event_ids_truncated") else ""
+        lines.append(f"- Event IDs{suffix}: {', '.join(source.get('event_ids', []))}")
+
+    lines.extend([
+        "",
+        "### Destination-host investigation",
+        "",
+        f"- Node: \`host:{target.get('dst_ip', 'unknown')}\`",
+        f"- Event nodes targeting this host: **{destination.get('event_count', 0)}**",
+        f"- Distinct source hosts: **{destination.get('distinct_peer_host_count', 0)}**",
+        f"- Source hosts observed: {', '.join(destination.get('distinct_peer_hosts', [])) or 'none returned'}",
+        f"- Attack-label distribution: {destination.get('attack_type_counts', {})}",
+        f"- Observed time range: {destination.get('time_start', 'unknown')} to {destination.get('time_end', 'unknown')}",
+    ])
+    if destination.get("event_ids"):
+        suffix = " (truncated)" if destination.get("event_ids_truncated") else ""
+        lines.append(f"- Event IDs{suffix}: {', '.join(destination.get('event_ids', []))}")
+
+    cluster = assessment.get("attack_type_cluster_profile", {})
+    exact_tuple = assessment.get("exact_source_destination_label_cluster", {})
+    lines.extend([
+        "",
+        "### Attack-type cluster and exact-tuple test",
+        "",
+        f"- Category node: \`attack:{target.get('attack_type', 'unknown')}\`",
+        f"- Events linked to category: **{cluster.get('event_count', 0)}**",
+        f"- Distinct sources / destinations in category cluster: **{cluster.get('distinct_source_count', 0)} / {cluster.get('distinct_destination_count', 0)}**",
+        f"- Exact same source + destination + category tuple: **{exact_tuple.get('event_count', 0)} event(s)**",
+        f"- Category-cluster time range: {cluster.get('time_start', 'unknown')} to {cluster.get('time_end', 'unknown')}",
+    ])
+    if exact_tuple.get("event_ids"):
+        suffix = " (truncated)" if exact_tuple.get("event_ids_truncated") else ""
+        lines.append(f"- Exact-tuple event IDs{suffix}: {', '.join(exact_tuple.get('event_ids', []))}")
+    if cluster.get("event_ids"):
+        suffix = " (truncated)" if cluster.get("event_ids_truncated") else ""
+        lines.append(f"- Category-cluster event IDs{suffix}: {', '.join(cluster.get('event_ids', []))}")
+
+    lines.extend(["", "### Temporal investigation", ""])
+    predecessors = assessment.get("direct_temporal_predecessors", [])
+    successors = assessment.get("direct_temporal_successors", [])
+    lines.append(f"- Direct explicit temporal predecessors: {predecessors if predecessors else 'none'}")
+    lines.append(f"- Direct explicit temporal successors: {successors if successors else 'none'}")
+    sequence = assessment.get("temporal_sequence", [])
+    if sequence:
+        lines.extend([
+            "",
+            "| Event | Start time | Attack label | Source → Destination |",
+            "|---|---|---|---|",
+        ])
+        for item in sequence[:40]:
+            lines.append(
+                f"| {item.get('event_id')} | {item.get('start_time', 'unknown')} | "
+                f"{item.get('attack_type', 'unknown')} | "
+                f"{item.get('src_ip', 'unknown')} → {item.get('dst_ip', 'unknown')} |"
+            )
+        if len(sequence) > 40:
+            lines.append(f"Showing 40 of {len(sequence)} events in the explicit temporal subgraph.")
+        lines.append(
+            "Ordering is based only on graph edges labelled 'precedes'; identical displayed timestamps "
+            "do not establish sub-minute ordering."
+        )
+    else:
+        lines.append("- No explicit temporal sequence was found around the selected event.")
+
+    component = assessment.get("connected_component", {})
+    lines.extend([
+        "",
+        "### Component scope",
+        "",
+        f"- Event nodes in the selected event's undirected component: **{component.get('event_count', 0)}**",
+        f"- Event IDs: {', '.join(component.get('event_ids', [])) or 'none'}",
+        f"- Interpretation: {component.get('interpretation', 'Component membership is graph connectivity only.')}",
+    ])
+    if component.get("event_ids_truncated"):
+        lines.append("- Component event-ID list is truncated.")
+
+    lines.extend(["", "## 4. Investigation hypotheses", ""])
+    hypotheses = result.get("hypotheses", []) or assessment.get("hypotheses", [])
+    if hypotheses:
+        for hypothesis in hypotheses:
+            lines.append(
+                f"- **{hypothesis.get('claim', '')}** "
+                f"(confidence: {hypothesis.get('confidence', 'unknown')})"
+            )
+            for evidence_item in hypothesis.get("supporting_evidence", []):
+                lines.append(f"  - Evidence: {evidence_item}")
+    else:
+        lines.append("- No testable hypothesis was returned.")
+
+    lines.extend(["", "## 5. Analyst synthesis", ""])
+    if result.get("summary") and result.get("summary") != assessment.get("executive_assessment"):
+        lines.append(str(result.get("summary")))
+    observed = result.get("observed_evidence", [])
+    if observed:
+        lines.extend(["", "### Additional observed evidence"])
+        lines.extend(f"- {item}" for item in observed[:10])
+    if result.get("risk_rationale"):
+        lines.extend(["", "### Graph-based confidence and impact"])
+        lines.append(str(result.get("risk_rationale")))
+
+    lines.extend(["", "## 6. Recommended analyst actions", ""])
+    recommendations = result.get("recommended_next_steps") or assessment.get("recommended_investigations", [])
+    if recommendations:
+        lines.extend(f"{index}. {item}" for index, item in enumerate(recommendations, 1))
+    else:
+        lines.append("- No recommendations were returned.")
+
+    lines.extend(["", "## 7. Agent tool-use audit", ""])
+    if agent_run:
+        lines.append(f"- Planner rounds completed: {agent_run.get('rounds_completed', 0)}")
+        lines.append(f"- Graph tools executed: {agent_run.get('tool_calls_executed', 0)}")
+        for item in agent_run.get("trace", []):
+            if item.get("tool"):
+                lines.append(
+                    f"- Round {item.get('round')}: \`{item.get('tool')}\` — {item.get('status', 'unknown')}"
+                )
+                if item.get("purpose"):
+                    lines.append(f"  - Investigation question: {item.get('purpose')}")
+            elif item.get("planner_status") == "deterministic_fallback":
+                lines.append(f"- Planner fallback: {item.get('reason')}")
+            elif item.get("planner_status") == "error":
+                lines.append(f"- Planner error: {item.get('error')}")
+    else:
+        lines.append("- Offline deterministic graph mode; no LLM planner was called.")
+
+    lines.extend(["", "## 8. Secondary detector context", ""])
     score = detector.get("mean_anomaly_score")
     threshold = detector.get("isolation_forest_threshold", ISOLATION_FOREST_THRESHOLD)
     flagged = detector.get("pipeline_flagged_suspicious_by_threshold")
     if score is not None:
         flag_text = "flagged suspicious" if flagged else "not below threshold"
         lines.append(
-            f"- Mean anomaly score: {score:.6f}; threshold: {threshold:.6f}; "
+            f"- Isolation Forest mean decision score: {score:.6f}; threshold: {threshold:.6f}; "
             f"pipeline result: **{flag_text}**."
         )
-    lines.append(
-        "- This detector result is an anomaly flag, not proof of successful or failed authentication."
-    )
-    lines.extend(["", "## Observed evidence", ""])
-    lines.extend(f"- {x}" for x in result.get("observed_evidence", []))
-    graph_analysis = payload.get("graph_analysis", {})
-    if graph_analysis:
-        lines.extend(["", "## Attack graph analysis", ""])
-        metrics = graph_analysis.get("graph_metrics", {})
-        lines.extend([
-            f"- Full graph: {metrics.get('full_graph_nodes', 0)} nodes, {metrics.get('full_graph_edges', 0)} edges.",
-            f"- Selected event scope: {metrics.get('scope_nodes', 0)} nodes, {metrics.get('scope_edges', 0)} edges, up to {metrics.get('scope_hops', 0)} hops.",
-            f"- Target degree: in={metrics.get('target_in_degree', 0)}, out={metrics.get('target_out_degree', 0)}.",
-            f"- Explicit temporal edges: {graph_analysis.get('temporal_sequence', {}).get('explicit_precedes_edges', 0)}.",
-            f"- Connected-component event count: {graph_analysis.get('connected_component', {}).get('event_count', 0)}.",
-            f"- Attack-type cluster event count: {graph_analysis.get('attack_type_cluster', {}).get('event_count', 0)}.",
-        ])
+    else:
+        lines.append("- No usable Isolation Forest score was available.")
+    lines.append("- Detector output is secondary context, not the graph-based incident assessment or an impact probability.")
+    if target.get("triage_score") is not None:
         lines.append(
-            "- Connected-component and attack-type-cluster membership describe graph links only; "
-            "they do not prove one incident, campaign or successful impact."
+            f"- Existing heuristic triage score: {target.get('triage_score')}; prioritisation context only, not a probability."
         )
-        component_events = graph_analysis.get("connected_component", {}).get("event_ids", [])
-        if component_events:
-            shown_component_events = component_events[:30]
-            truncation_note = (
-                f" (showing {len(shown_component_events)} of {len(component_events)})"
-                if len(component_events) > len(shown_component_events) else ""
-            )
-            lines.append(
-                f"- Connected event IDs{truncation_note}: "
-                f"{', '.join(str(x) for x in shown_component_events)}."
-            )
-        cluster = graph_analysis.get("attack_type_cluster", {})
-        cluster_events = cluster.get("event_ids", [])
-        if cluster_events:
-            shown_cluster_events = cluster_events[:30]
-            truncation_note = (
-                f" (showing {len(shown_cluster_events)} of {len(cluster_events)})"
-                if len(cluster_events) > len(shown_cluster_events) else ""
-            )
-            lines.append(
-                f"- Events linked to attack-type node {cluster.get('attack_type')}{truncation_note}: "
-                f"{', '.join(str(x) for x in shown_cluster_events)}."
-            )
-        neighborhood_edges = graph_analysis.get("neighborhood", {}).get("edges", [])
-        if neighborhood_edges:
-            target_node = f"event:{payload.get('event_id')}"
-            neighborhood_edges = sorted(
-                neighborhood_edges,
-                key=lambda edge: (
-                    0 if target_node in {str(edge.get("source")), str(edge.get("target"))} else 1,
-                    str(edge.get("relation", "")),
-                    str(edge.get("source", "")),
-                    str(edge.get("target", "")),
-                ),
-            )
-            edge_limit = 35
-            lines.extend([
-                "",
-                f"### Relation-labelled graph edges (showing {min(edge_limit, len(neighborhood_edges))} of {len(neighborhood_edges)})",
-            ])
-            for edge in neighborhood_edges[:edge_limit]:
-                lines.append(
-                    f"- {edge.get('source')} --{edge.get('relation')}--> {edge.get('target')}"
-                )
-        temporal_sequence = graph_analysis.get("temporal_sequence", {}).get("sequence", [])
-        if temporal_sequence:
-            temporal_limit = 30
-            lines.extend([
-                "",
-                f"### Explicit temporal sequence (showing {min(temporal_limit, len(temporal_sequence))} of {len(temporal_sequence)})",
-            ])
-            for item in temporal_sequence[:temporal_limit]:
-                lines.append(
-                    f"- {item.get('start_time', 'unknown')} — {item.get('event_id')}: "
-                    f"{item.get('attack_type')} ({item.get('src_ip')} -> {item.get('dst_ip')})"
-                )
-            lines.append(
-                "- Sequence is taken from explicit graph 'precedes' edges; identical displayed timestamps "
-                "do not establish sub-minute ordering."
-            )
-        else:
-            lines.append("- No explicit temporal sequence around the selected event was established from 'precedes' edges.")
-        shared_summary = graph_analysis.get("shared_host_events", {})
-        shared = shared_summary.get("relationships", [])
-        shared_limit = 30
-        shared_count = shared_summary.get("relationship_count", len(shared))
+
+    lines.extend(["", "## 9. Limitations and evidence gaps", ""])
+    limitations = result.get("limitations", [])
+    if limitations:
+        lines.extend(f"- {item}" for item in limitations)
+    else:
         lines.extend([
-            "",
-            f"### Shared-host relationships (showing {min(shared_limit, len(shared))} of {shared_count})",
+            "- Dataset attack labels do not independently prove impact.",
+            "- Shared graph nodes do not independently prove one campaign.",
+            "- Network-flow graph evidence does not establish endpoint or service outcomes.",
         ])
-        if shared:
-            for item in shared[:shared_limit]:
-                lines.append(
-                    f"- {item.get('host_node')} ({item.get('role_for_selected_event')}): "
-                    f"{item.get('related_event_id')}"
-                )
-        else:
-            lines.append("- No other event nodes were found adjacent to the selected source/destination host nodes.")
-        paths = graph_analysis.get("structural_paths", {}).get("paths", [])
-        paths_returned = graph_analysis.get("structural_paths", {}).get("paths_returned", len(paths))
-        path_limit = 10
-        lines.extend([
-            "",
-            f"### Structural paths (showing {min(path_limit, len(paths))} of {paths_returned})",
-        ])
-        if paths:
-            for item in paths[:path_limit]:
-                lines.append(" - " + " -> ".join(str(node.get("id")) for node in item))
-            lines.append("- Paths represent graph connectivity only, not confirmed attacker movement.")
-        else:
-            lines.append("- No directed source-to-destination path was returned by the graph.")
-    agent_run = payload.get("agent_run", {})
-    if agent_run:
-        lines.extend(["", "## Agent tool-use trace", ""])
-        lines.append(f"- Planner rounds completed: {agent_run.get('rounds_completed', 0)}")
-        lines.append(f"- Graph tools executed: {agent_run.get('tool_calls_executed', 0)}")
-        for item in agent_run.get("trace", []):
-            if item.get("tool"):
-                lines.append(
-                    f"- Round {item.get('round')}: {item.get('tool')} — {item.get('status', 'unknown')}"
-                )
-                if item.get("purpose"):
-                    lines.append(f"  - Purpose: {item.get('purpose')}")
-            elif item.get("planner_status") == "deterministic_fallback":
-                lines.append(f"- Planner fallback: {item.get('reason')}")
-            elif item.get("planner_status") == "error":
-                lines.append(f"- Planner error: {item.get('error')}")
-    lines.extend(["", "## Hypotheses", ""])
-    for hypothesis in result.get("hypotheses", []):
-        lines.append(
-            f"- **{hypothesis.get('claim', '')}** "
-            f"(confidence: {hypothesis.get('confidence', 'unknown')})"
-        )
-        lines.extend(
-            f"  - Evidence: {x}"
-            for x in hypothesis.get("supporting_evidence", [])
-        )
-    lines.extend(["", "## Timeline", ""])
-    lines.extend(
-        f"- **{item.get('time', 'unknown')}** — {item.get('event', '')} "
-        f"({item.get('evidence', '')})"
-        for item in result.get("timeline", [])
-    )
-    lines.extend(["", "## Risk rationale", "", str(result.get("risk_rationale", "")), ""])
-    lines.extend(["## Recommended next steps", ""])
-    lines.extend(f"- {x}" for x in result.get("recommended_next_steps", []))
-    lines.extend(["", "## Limitations", ""])
-    lines.extend(f"- {x}" for x in result.get("limitations", []))
-    lines.extend(
-        [
-            "",
-            "## Evidence metadata",
-            "",
-            f"- Related events returned: {payload['evidence']['related_event_count']}",
-            f"- Graph context available: {'yes' if payload['evidence']['graph_context'] else 'no'}",
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines), encoding="utf-8")
+
+    evidence = payload.get("evidence", {})
+    metrics = graph_analysis.get("graph_metrics", {})
+    lines.extend([
+        "",
+        "## Evidence metadata",
+        "",
+        f"- Time-window/shared-host event-level correlation count: {evidence.get('related_event_count', 0)}",
+        f"- Full graph: {metrics.get('full_graph_nodes', 0)} nodes / {metrics.get('full_graph_edges', 0)} edges",
+        "",
+    ])
+    path.write_text("\\n".join(lines), encoding="utf-8")
+
 
 
 def run(
