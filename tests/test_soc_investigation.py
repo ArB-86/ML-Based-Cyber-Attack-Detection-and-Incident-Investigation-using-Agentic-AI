@@ -2,8 +2,15 @@ import json
 
 import pandas as pd
 
+from attack_graph.event_builder import EventConfig, build_attack_events
 from attack_graph.soc_detection import BehaviourThresholds, detect_behavioral_alerts, merge_detector_outputs
-from attack_graph.soc_investigation import build_soc_events, build_soc_graph, run_soc_investigation
+from attack_graph.soc_investigation import (
+    EventCorrelationAgent,
+    IncidentFormationAgent,
+    build_soc_events,
+    build_soc_graph,
+    run_soc_investigation,
+)
 
 
 def _time(minute: int, second: int = 0) -> str:
@@ -290,3 +297,59 @@ def test_reasoner_failure_falls_back_to_deterministic_investigation(tmp_path):
     assert "TimeoutError" in agent["reasoner_error"]
     assert agent["findings"]
     assert len(agent["tool_calls"]) >= 5
+
+
+def test_legacy_event_builder_never_uses_dataset_label_for_alert_selection():
+    raw = pd.DataFrame([
+        {
+            "Timestamp": _time(0, second),
+            "Source IP": "10.0.0.1",
+            "Destination IP": "10.0.0.9",
+            "Source Port": 40000 + second,
+            "Destination Port": 22,
+            "Protocol": 6,
+            "Label": "PortScan",
+        }
+        for second in range(3)
+    ])
+    try:
+        build_attack_events(raw, anomalous_only=True, config=EventConfig())
+    except ValueError as exc:
+        assert "Label is intentionally not used" in str(exc)
+    else:
+        raise AssertionError("Label-only inputs must not create operational attack events.")
+
+    predicted = raw.assign(**{"Predicted Anomaly": True})
+    events = build_attack_events(predicted, anomalous_only=True)
+    assert len(events) == 1
+    assert int(events.iloc[0]["flow_count"]) == 3
+    assert events.iloc[0]["detection_reasons"] == "ISOLATION_FOREST_ANOMALY"
+
+
+def test_explicit_correlation_table_is_the_incident_formation_input():
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 22, "alert": True,
+            "detection_reasons": "BRUTE_FORCE_PATTERN", "alert_sources": "BEHAVIOURAL_RULE",
+        },
+        {
+            "timestamp": _time(1), "src_ip": "B", "dst_ip": "C", "protocol": 6,
+            "src_port": 22, "dst_port": 445, "alert": True,
+            "detection_reasons": "HIGH_SOURCE_FANOUT", "alert_sources": "BEHAVIOURAL_RULE",
+        },
+    ])
+    events = build_soc_events(flows)
+    correlations = EventCorrelationAgent(events, max_gap_seconds=300).correlate()
+    assert not correlations.empty
+    assert correlations["relation"].str.contains("host_pivot").any()
+
+    formed = IncidentFormationAgent(events, correlations).form()
+    assert len(formed) == 1
+    assert set(formed[0][1]) == {"event:EVT-000001", "event:EVT-000002"}
+
+    disconnected = IncidentFormationAgent(
+        events,
+        correlations.iloc[0:0],
+    ).form()
+    assert len(disconnected) == 2
