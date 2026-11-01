@@ -1430,6 +1430,7 @@ def run_soc_investigation(
     output_dir: str | Path,
     *,
     reasoner=None,
+    pipeline_context: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
     """Run correlation -> incident formation -> graph -> risk -> agent tools -> report."""
     out = Path(output_dir)
@@ -1440,6 +1441,7 @@ def run_soc_investigation(
         out,
         reasoner=reasoner,
         alert_flow_count=len(alert_flows),
+        pipeline_context=pipeline_context,
     )
 
 
@@ -1449,6 +1451,7 @@ def run_soc_investigation_from_events(
     *,
     reasoner=None,
     alert_flow_count: int | None = None,
+    pipeline_context: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
     """Continue the canonical workflow from an already-formed event table."""
     out = Path(output_dir)
@@ -1546,14 +1549,22 @@ def run_soc_investigation_from_events(
         "pipeline": "cicids2017_soc_incident_investigation",
         "version": "1.0",
         "stages": [
-            {"name": "event_correlation", "status": "completed", "output": "attack_events.csv"},
+            {"name": "data_ingestion", "status": "completed", "details": (pipeline_context or {}).get("ingestion", {})},
+            {"name": "metadata_preprocessing", "status": "completed", "details": (pipeline_context or {}).get("preprocessing", {})},
+            {"name": "ml_detection", "status": "completed", "details": (pipeline_context or {}).get("ml_detection", {})},
+            {"name": "behavioural_detection", "status": "completed", "details": (pipeline_context or {}).get("behavioural_detection", {})},
+            {"name": "alert_fusion", "status": "completed", "output": "suspicious_flows_with_metadata.csv"},
+            {"name": "event_aggregation", "status": "completed", "output": "attack_events.csv"},
+            {"name": "event_correlation", "status": "completed", "output": "event_correlations.csv"},
             {"name": "incident_formation", "status": "completed", "output": "incident_investigation.json"},
-            {"name": "attack_graph", "status": "completed", "output": "attack_graph.gexf"},
+            {"name": "attack_graph_construction", "status": "completed", "output": "attack_graph.gexf"},
             {"name": "risk_assessment", "status": "completed", "output": "incident_investigation.json"},
             {"name": "agentic_investigation", "status": "completed", "tool_calls": tool_call_count},
-            {"name": "reporting", "status": "completed", "output": "incident_investigation_report.md"},
+            {"name": "evidence_backed_reporting", "status": "completed", "output": "incident_investigation_report.md"},
         ],
+        "pipeline_context": pipeline_context or {},
         "counts": {
+            "dataset_flows": (pipeline_context or {}).get("ingestion", {}).get("rows_loaded"),
             "alerts": alert_flow_count,
             "events": len(events),
             "correlations": len(correlations),
