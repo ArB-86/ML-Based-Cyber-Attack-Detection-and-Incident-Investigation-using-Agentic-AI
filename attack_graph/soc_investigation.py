@@ -1718,18 +1718,27 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
     critical = sum(i["triage"]["severity"] == "CRITICAL" for i in incidents)
     high = sum(i["triage"]["severity"] == "HIGH" for i in incidents)
     medium = sum(i["triage"]["severity"] == "MEDIUM" for i in incidents)
+    assigned_event_ids = {
+        str(event_id)
+        for incident in incidents
+        for event_id in incident.get("event_ids", [])
+    }
+    all_event_ids = set(events["event_id"].astype(str)) if not events.empty else set()
+    unassigned_event_count = len(all_event_ids - assigned_event_ids)
     lines = [
         "# SOC Incident Investigation Report", "",
         "> Evidence-first graph investigation. Ground-truth dataset labels are not used to select alerts, construct the graph, correlate incidents, calculate severity or map ATT&CK hypotheses.",
-        "> Severity is a heuristic triage priority, not a calibrated probability or confirmed compromise verdict.", "",
+        "> Priority score is a heuristic analyst-workload ranking, not a calibrated probability or confirmed compromise verdict. Without at least two distinct out-of-band telemetry categories, severity is capped at MEDIUM and confidence cannot be HIGH.", "",
         "## 1. Executive summary", "",
         f"- Candidate incidents: **{len(incidents):,}**",
-        f"- Events investigated: **{len(events):,}**",
+        f"- Alert events supplied: **{len(events):,}**",
+        f"- Events assigned to candidate incidents: **{len(assigned_event_ids):,}**",
+        f"- Events not promoted into incidents: **{unassigned_event_count:,}**",
         f"- Alert flows represented: **{int(events['flow_count'].sum()) if not events.empty else 0:,}**",
         f"- Graph size: **{graph.number_of_nodes():,} nodes / {graph.number_of_edges():,} edges**",
         f"- Priority distribution: **{critical} critical / {high} high / {medium} medium**", "",
         "## 2. Prioritised incident queue", "",
-        "| Priority | Incident | Risk / 100 | Confidence | Events | Sources | Targets | Key evidence |",
+        "| Priority | Incident | Priority score / 100 | Confidence | Events | Sources | Targets | Key evidence |",
         "|---|---|---:|---|---:|---:|---:|---|",
     ]
     for item in incidents:
@@ -1742,7 +1751,13 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
         )
     lines.extend(["", "## 3. Analyst investigation findings", ""])
     if not incidents:
-        lines.append("No alert events were supplied. This is not proof of benign traffic; verify ingestion, detector coverage and model health.")
+        if events.empty:
+            lines.append("No alert events were supplied. This is not proof of benign traffic; verify ingestion, detector coverage and model health.")
+        else:
+            lines.append(
+                f"{len(events):,} alert events were supplied, but none met the bounded incident-formation policy. "
+                "They remain available in the event/flow artefacts and should not be interpreted as confirmed benign traffic."
+            )
     for item in incidents[:15]:
         g, triage = item["graph_analysis"], item["triage"]
         risk_breakdown = ", ".join(
@@ -1756,8 +1771,8 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
         lines.extend([
             f"### {item['incident_id']} — {item['title']}", "",
             f"**Severity:** {triage['severity']}  ",
-            f"**Risk score:** {triage['risk_score']:.1f}/100  ",
-            f"**Confidence:** {triage['confidence']}  ",
+            f"**Triage priority score:** {triage['priority_score']:.1f}/100  ",
+            f"**Confidence:** {triage['confidence']} — {triage.get('confidence_basis', 'basis not recorded')}  ",
             f"**Window:** {item['start_time']} to {item['end_time']} ({item['duration_seconds']:.1f}s)", "",
             f"**Observed scope:** {len(item['event_ids'])} events, {item['total_flows']:,} flows, {g['unique_sources']} sources and {g['unique_targets']} destinations.",
             f"**Detection evidence:** {', '.join(item['detection_reasons']) or 'No actionable behavioural rule token'}.",
@@ -1822,8 +1837,8 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
 
     lines.extend([
         "## 4. Graph-analysis method", "",
-        "The graph contains typed host, event, service and detection nodes. Events are linked independently by shared source, shared destination, shared destination service and target-to-source host pivots. Connected event components form candidate incidents. The analysis measures source fan-out, destination convergence, service diversity and temporal chains.", "",
-        "Isolation Forest is a primary anomaly signal. The current CICIDS2017 validation-informed policy allows BRUTE_FORCE_PATTERN to create an actionable rule alert, routes PORT_SCAN to a separate review queue, and retains HIGH_SOURCE_FANOUT, HORIZONTAL_SCAN and DISTRIBUTED_DOS_PATTERN as context-only telemetry. These rules must be revalidated on representative operational data before deployment. Graph relationships provide investigation context; they do not establish a single campaign on their own. Risk remains a prioritisation heuristic, not a probability.", "",
+        "The typed graph retains shared-source, shared-target, shared-service and directional host-pivot relationships as inspectable context. Incident membership is deliberately narrower: only same-source temporal edges (maximum 60-second gap) and directional host-pivot edges (maximum 120-second gap) can join events, and each candidate campaign is bounded to a 900-second total span. Same-target and same-service edges never merge incidents. Isolated anomaly-only and review-only events are not promoted into incidents; standalone brute-force candidates and imported legacy records are retained for analyst review.", "",
+        "Isolation Forest is a primary anomaly signal. The current CICIDS2017 validation-informed policy allows BRUTE_FORCE_PATTERN to create an actionable rule alert, routes PORT_SCAN to a separate review queue, and retains HIGH_SOURCE_FANOUT, HORIZONTAL_SCAN and DISTRIBUTED_DOS_PATTERN as context-only telemetry. T1021 requires a remote-service port on the exact inbound event in a directed host-pivot pair. These rules must be revalidated on representative operational data before deployment. Network-flow-only evidence cannot establish successful authentication, lateral movement or compromise. Priority score is not a compromise probability; HIGH confidence requires at least two distinct out-of-band telemetry categories.", "",
         "## 5. Data limitations and analyst validation", "",
         "- CICIDS2017 is a labelled benchmark dataset, not live SOC telemetry. Ground-truth Label is excluded from alert selection and all investigation stages; use it separately for offline evaluation only.",
         "- Behaviour rules use fixed time buckets and can miss activity spanning bucket boundaries. Streaming deployment requires stateful rolling windows.",
@@ -1934,6 +1949,13 @@ def run_soc_investigation_from_events(
         ).run()
         if not events.empty else []
     )
+    assigned_event_ids = {
+        str(event_id)
+        for incident in incidents
+        for event_id in incident.get("event_ids", [])
+    }
+    all_event_ids = set(events["event_id"].astype(str)) if not events.empty else set()
+    unassigned_event_count = len(all_event_ids - assigned_event_ids)
 
     evidence_tools = IncidentEvidenceTools(incidents, events, graph)
     agent = AgenticInvestigationAgent(evidence_tools, reasoner=reasoner)
@@ -2020,6 +2042,8 @@ def run_soc_investigation_from_events(
             "events": len(events),
             "correlations": len(correlations),
             "incidents": len(incidents),
+            "unassigned_events": unassigned_event_count,
+            "assigned_events": len(assigned_event_ids),
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
             "agent_tool_calls": tool_call_count,
@@ -2045,6 +2069,8 @@ def run_soc_investigation_from_events(
     )
     summary = {
         "incident_count": len(incidents),
+        "assigned_event_count": len(assigned_event_ids),
+        "unassigned_event_count": unassigned_event_count,
         "critical_incidents": sum(i["triage"]["severity"] == "CRITICAL" for i in incidents),
         "high_incidents": sum(i["triage"]["severity"] == "HIGH" for i in incidents),
         "graph_event_links": sum(i["graph_analysis"]["graph_event_links"] for i in incidents),
