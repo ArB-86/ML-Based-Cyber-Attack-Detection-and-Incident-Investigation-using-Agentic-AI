@@ -164,11 +164,161 @@ def _add_edge(graph: nx.DiGraph, source: str, target: str, relation: str, **attr
                        **{key: value for key, value in attrs.items() if value is not None})
 
 
-def build_soc_graph(events: pd.DataFrame, max_gap_seconds: int = 300) -> nx.DiGraph:
-    """Typed host-event-service-detection graph with temporal links and pivots."""
+CORRELATION_COLUMNS = [
+    "from_event", "to_event", "relation", "gap_seconds",
+    "overlap_seconds", "shared_entity", "pivot_host",
+]
+
+
+class EventCorrelationAgent:
+    """Correlate events by shared network entities and temporal relationships."""
+
+    def __init__(self, events: pd.DataFrame, max_gap_seconds: int = 300):
+        self.events = events.copy()
+        self.max_gap_seconds = max_gap_seconds
+
+    def correlate(self) -> pd.DataFrame:
+        if self.max_gap_seconds < 0:
+            raise ValueError("max_gap_seconds must be non-negative.")
+        if self.events.empty:
+            return pd.DataFrame(columns=CORRELATION_COLUMNS)
+
+        work = self.events.copy().reset_index(drop=True)
+        for column in ("start_time", "end_time"):
+            work[column] = pd.to_datetime(
+                work[column], errors="coerce", utc=True, format="mixed"
+            )
+        required = {"event_id", "start_time", "end_time", "src_ip", "dst_ip"}
+        missing = required - set(work.columns)
+        if missing:
+            raise ValueError(f"Event correlation is missing columns: {sorted(missing)}")
+        if work[["start_time", "end_time"]].isna().any().any():
+            raise ValueError("Event correlation requires valid event timestamps.")
+
+        entity_events: dict[tuple[str, str], list[pd.Series]] = {}
+        received: dict[str, list[tuple[pd.Timestamp, str]]] = {}
+        initiated: dict[str, list[tuple[pd.Timestamp, str]]] = {}
+
+        for _, event in work.iterrows():
+            event_id = str(event["event_id"])
+            src, dst = str(event["src_ip"]), str(event["dst_ip"])
+            entity_events.setdefault(("source", src), []).append(event)
+            entity_events.setdefault(("target", dst), []).append(event)
+            received.setdefault(dst, []).append((event["end_time"], event_id))
+            initiated.setdefault(src, []).append((event["start_time"], event_id))
+
+            ports = event.get("dst_ports", [])
+            if isinstance(ports, str):
+                try:
+                    import ast
+                    ports = ast.literal_eval(ports)
+                except (SyntaxError, ValueError):
+                    ports = []
+            if not isinstance(ports, (list, tuple, set)):
+                ports = []
+            for port in sorted({
+                int(value) for value in ports
+                if str(value).isdigit() and 0 <= int(value) <= 65535
+            }):
+                service = f"{str(event.get('protocol', 'unknown')).lower()}/{port}"
+                entity_events.setdefault(("service", service), []).append(event)
+
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(
+            previous_id: str,
+            current_id: str,
+            relation: str,
+            previous_end: pd.Timestamp,
+            current_start: pd.Timestamp,
+            shared_entity: str | None = None,
+            pivot_host: str | None = None,
+        ) -> None:
+            if previous_id == current_id:
+                return
+            raw_gap = (current_start - previous_end).total_seconds()
+            gap = max(0.0, raw_gap)
+            overlap = max(0.0, -raw_gap)
+            if gap > self.max_gap_seconds:
+                return
+            key = (previous_id, current_id, relation)
+            if key in seen:
+                return
+            seen.add(key)
+            records.append({
+                "from_event": previous_id,
+                "to_event": current_id,
+                "relation": relation,
+                "gap_seconds": float(gap),
+                "overlap_seconds": float(overlap),
+                "shared_entity": shared_entity,
+                "pivot_host": pivot_host,
+            })
+
+        # Consecutive relationships for each entity avoid a quadratic all-pairs
+        # join while allowing source, target and service links independently.
+        for (kind, entity), rows in entity_events.items():
+            rows.sort(key=lambda row: (row["start_time"], row["end_time"], str(row["event_id"])))
+            for previous, current in zip(rows, rows[1:]):
+                add(
+                    str(previous["event_id"]),
+                    str(current["event_id"]),
+                    f"same_{kind}_temporal",
+                    previous["end_time"],
+                    current["start_time"],
+                    shared_entity=entity,
+                )
+
+        # Target-to-source pivot: an asset that was targeted, then later
+        # initiated another connection. Retain exact event IDs and pivot host.
+        for host, source_events in initiated.items():
+            prior = sorted(received.get(host, []), key=lambda item: item[0])
+            prior_times = [item[0] for item in prior]
+            for start_time, source_event_id in source_events:
+                position = bisect_right(prior_times, start_time) - 1
+                if position < 0:
+                    continue
+                end_time, target_event_id = prior[position]
+                if target_event_id == source_event_id:
+                    continue
+                gap = (start_time - end_time).total_seconds()
+                if 0 <= gap <= self.max_gap_seconds:
+                    add(
+                        target_event_id,
+                        source_event_id,
+                        "host_pivot",
+                        end_time,
+                        start_time,
+                        pivot_host=host,
+                    )
+
+        if not records:
+            return pd.DataFrame(columns=CORRELATION_COLUMNS)
+        result = pd.DataFrame(records, columns=CORRELATION_COLUMNS)
+        return result.sort_values(
+            ["from_event", "to_event", "relation"],
+            kind="stable",
+        ).reset_index(drop=True)
+
+
+def build_soc_graph(
+    events: pd.DataFrame,
+    correlations: pd.DataFrame | None = None,
+) -> nx.DiGraph:
+    """Build the typed attack graph from events and explicit correlation edges.
+
+    Correlation is deliberately a separate preceding stage. If no correlation
+    table is supplied, it is generated through EventCorrelationAgent for
+    compatibility with existing callers.
+    """
     graph = nx.DiGraph()
-    graph.graph["schema"] = "soc-investigation-graph-v2"
+    graph.graph["schema"] = "soc-investigation-graph-v3"
     graph.graph["ground_truth_labels_used"] = False
+    if correlations is None:
+        correlations = EventCorrelationAgent(events).correlate()
+    graph.graph["correlation_count"] = int(len(correlations))
+
     if events.empty:
         return graph
 
@@ -178,20 +328,22 @@ def build_soc_graph(events: pd.DataFrame, max_gap_seconds: int = 300) -> nx.DiGr
     if work[["start_time", "end_time"]].isna().any().any():
         raise ValueError("Graph construction requires valid event timestamps.")
 
-    entity_groups: dict[tuple[str, str], list[pd.Series]] = {}
-    received: dict[str, list[tuple[pd.Timestamp, str]]] = {}
-    initiated: dict[str, list[tuple[pd.Timestamp, str]]] = {}
     for _, event in work.iterrows():
         eid, src, dst = str(event["event_id"]), str(event["src_ip"]), str(event["dst_ip"])
         enode, snode, dnode = f"event:{eid}", f"host:{src}", f"host:{dst}"
         graph.add_node(snode, node_type="host", label=src, ip=src)
         graph.add_node(dnode, node_type="host", label=dst, ip=dst)
+
         event_attrs = {
-            "node_type": "event", "event_id": eid, "label": eid,
+            "node_type": "event",
+            "event_id": eid,
+            "label": eid,
             "start_time": event["start_time"].isoformat(),
             "end_time": event["end_time"].isoformat(),
-            "protocol": str(event["protocol"]), "flow_count": int(event["flow_count"]),
+            "protocol": str(event.get("protocol", "unknown")),
+            "flow_count": int(event.get("flow_count", 0)),
             "detection_reasons": str(event.get("detection_reasons", "")),
+            "alert_sources": str(event.get("alert_sources", "")),
         }
         score = event.get("mean_anomaly_score")
         if score is not None and pd.notna(score):
@@ -199,19 +351,24 @@ def build_soc_graph(events: pd.DataFrame, max_gap_seconds: int = 300) -> nx.DiGr
         graph.add_node(enode, **event_attrs)
         _add_edge(graph, snode, enode, "originates")
         _add_edge(graph, enode, dnode, "targets")
-        entity_groups.setdefault(("source", src), []).append(event)
-        entity_groups.setdefault(("target", dst), []).append(event)
-        received.setdefault(dst, []).append((event["end_time"], eid))
-        initiated.setdefault(src, []).append((event["start_time"], eid))
 
         ports = event.get("dst_ports", [])
+        if isinstance(ports, str):
+            try:
+                import ast
+                ports = ast.literal_eval(ports)
+            except (SyntaxError, ValueError):
+                ports = []
         if not isinstance(ports, (list, tuple, set)):
             ports = []
-        for port in sorted({int(p) for p in ports if str(p).isdigit() and 0 <= int(p) <= 65535}):
-            service = f"service:{str(event['protocol']).lower()}/{port}"
-            graph.add_node(service, node_type="service", label=f"{event['protocol']}/{port}", port=port)
+        for port in sorted({
+            int(value) for value in ports
+            if str(value).isdigit() and 0 <= int(value) <= 65535
+        }):
+            protocol = str(event.get("protocol", "unknown")).lower()
+            service = f"service:{protocol}/{port}"
+            graph.add_node(service, node_type="service", label=f"{protocol}/{port}", port=port)
             _add_edge(graph, enode, service, "touches_service")
-            entity_groups.setdefault(("service", f"{str(event['protocol']).lower()}/{port}"), []).append(event)
 
         for reason in str(event.get("detection_reasons", "")).split(";"):
             reason = reason.strip()
@@ -220,34 +377,21 @@ def build_soc_graph(events: pd.DataFrame, max_gap_seconds: int = 300) -> nx.DiGr
                 graph.add_node(detection, node_type="detection", label=reason)
                 _add_edge(graph, enode, detection, "triggered_by")
 
-    # Correlate adjacent events independently for each shared entity. Same source
-    # OR same destination OR same service is enough; no AND condition.
-    for (kind, entity), rows in entity_groups.items():
-        rows.sort(key=lambda row: (row["start_time"], row["end_time"]))
-        for previous, current in zip(rows, rows[1:]):
-            if str(previous["event_id"]) == str(current["event_id"]):
-                continue
-            gap = (current["start_time"] - previous["end_time"]).total_seconds()
-            if 0 <= gap <= max_gap_seconds:
-                _add_edge(graph, f"event:{previous['event_id']}", f"event:{current['event_id']}",
-                          f"same_{kind}_temporal", gap_seconds=float(gap), shared_entity=entity)
-
-    # Host pivot: a target later becomes a source. Connect the nearest preceding
-    # inbound event rather than all historical pairs.
-    for host, source_events in initiated.items():
-        prior = sorted(received.get(host, []), key=lambda item: item[0])
-        prior_times = [item[0] for item in prior]
-        for start_time, source_eid in source_events:
-            pos = bisect_right(prior_times, start_time) - 1
-            if pos < 0:
-                continue
-            end_time, target_eid = prior[pos]
-            gap = (start_time - end_time).total_seconds()
-            if target_eid != source_eid and 0 <= gap <= max_gap_seconds:
-                _add_edge(graph, f"event:{target_eid}", f"event:{source_eid}",
-                          "host_pivot", gap_seconds=float(gap), pivot_host=host)
+    for _, edge in correlations.iterrows():
+        previous_id, current_id = str(edge["from_event"]), str(edge["to_event"])
+        source, target = f"event:{previous_id}", f"event:{current_id}"
+        if source not in graph or target not in graph:
+            raise ValueError(
+                f"Correlation references unknown event IDs: {previous_id}, {current_id}"
+            )
+        attrs = {
+            "gap_seconds": float(edge["gap_seconds"]),
+            "overlap_seconds": float(edge.get("overlap_seconds", 0.0) or 0.0),
+            "shared_entity": edge.get("shared_entity"),
+            "pivot_host": edge.get("pivot_host"),
+        }
+        _add_edge(graph, source, target, str(edge["relation"]), **attrs)
     return graph
-
 
 class GraphAnalystAgent:
     """Compute graph topology, event chains, host roles and destination concentration."""
