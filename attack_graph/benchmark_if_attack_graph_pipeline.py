@@ -344,16 +344,17 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     constant_present = [c for c in sorted(CONSTANT_FEATURES) if c in work.columns]
     work = work.drop(columns=constant_present)
 
-    # Build the 69-feature matrix. This follows the benchmark notebook:
-    # numeric conversion, +/-inf -> NaN, then whole-dataset median fill.
+    # Keep missing values here. The metadata pipeline fits medians on the
+    # training partition only, then applies those medians to validation/test.
+    # The separate exact-benchmark verifier intentionally mirrors the legacy
+    # notebook so historical metrics remain reproducible.
     x = pd.DataFrame(index=work.index)
     for col in BENCHMARK_FEATURES:
         x[col] = pd.to_numeric(work[col], errors="coerce")
 
     x = x.replace([np.inf, -np.inf], np.nan)
-    x = x.fillna(x.median(numeric_only=True))
 
-    # Keep the cleaned 69-feature values in the preserved metadata table too.
+    # Preserve the un-imputed numeric features in the metadata frame.
     for col in BENCHMARK_FEATURES:
         work[col] = x[col]
 
