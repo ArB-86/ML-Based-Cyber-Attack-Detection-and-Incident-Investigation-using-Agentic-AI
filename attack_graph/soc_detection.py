@@ -33,7 +33,15 @@ def detect_behavioral_alerts(
     """
     if flows.empty:
         return pd.DataFrame(
-            {"rule_alert": False, "detection_reasons": "", "rule_count": 0},
+            {
+                "rule_alert": False,
+                "detection_reasons": "",
+                "review_alert": False,
+                "review_reasons": "",
+                "context_signals": "",
+                "matched_rule_reasons": "",
+                "rule_count": 0,
+            },
             index=flows.index,
         )
 
@@ -110,9 +118,48 @@ def detect_behavioral_alerts(
         for position in active_positions:
             reasons_by_position[position].append(reason)
 
+    # Empirical CICIDS2017 validation showed that HIGH_SOURCE_FANOUT,
+    # HORIZONTAL_SCAN and DISTRIBUTED_DOS_PATTERN have extremely poor
+    # label-based precision in this dataset. Keep them as context signals;
+    # they must not independently create incidents.
+    #
+    # BRUTE_FORCE_PATTERN is retained as an actionable candidate because its
+    # validation precision was high, while PORT_SCAN is routed to a secondary
+    # analyst-review queue because its false-positive rate is materially higher.
+    actionable_rules = {"BRUTE_FORCE_PATTERN"}
+    review_rules = {"PORT_SCAN"}
+    context_rules = {
+        "HIGH_SOURCE_FANOUT",
+        "HORIZONTAL_SCAN",
+        "DISTRIBUTED_DOS_PATTERN",
+    }
+
+    actionable_by_position = [
+        [item for item in items if item in actionable_rules]
+        for items in reasons_by_position
+    ]
+    review_by_position = [
+        [item for item in items if item in review_rules]
+        for items in reasons_by_position
+    ]
+    context_by_position = [
+        [item for item in items if item in context_rules]
+        for items in reasons_by_position
+    ]
+
     result = pd.DataFrame(index=work.index)
-    result["rule_alert"] = [bool(items) for items in reasons_by_position]
+    result["rule_alert"] = [bool(items) for items in actionable_by_position]
     result["detection_reasons"] = [
+        ";".join(sorted(set(items))) for items in actionable_by_position
+    ]
+    result["review_alert"] = [bool(items) for items in review_by_position]
+    result["review_reasons"] = [
+        ";".join(sorted(set(items))) for items in review_by_position
+    ]
+    result["context_signals"] = [
+        ";".join(sorted(set(items))) for items in context_by_position
+    ]
+    result["matched_rule_reasons"] = [
         ";".join(sorted(set(items))) for items in reasons_by_position
     ]
     result["rule_count"] = [len(set(items)) for items in reasons_by_position]
@@ -128,6 +175,10 @@ def merge_detector_outputs(
     out = flows.copy()
     rules = detect_behavioral_alerts(out)
     out["rule_alert"] = rules["rule_alert"].astype(bool)
+    out["review_alert"] = rules["review_alert"].astype(bool)
+    out["review_reasons"] = rules["review_reasons"].fillna("").astype(str)
+    out["context_signals"] = rules["context_signals"].fillna("").astype(str)
+    out["matched_rule_reasons"] = rules["matched_rule_reasons"].fillna("").astype(str)
     reasons = rules["detection_reasons"].fillna("").astype(str)
 
     if "anomaly_score" in out.columns and anomaly_threshold is not None:
@@ -146,11 +197,10 @@ def merge_detector_outputs(
 
     model_flags = out["model_alert"].fillna(False).astype(bool)
     out["alert"] = out["rule_alert"] | model_flags
+    out["review_candidate"] = out["alert"] | out["review_alert"]
 
-    # Add the model reason exactly once. Do this in one pass over model-alert
-    # rows: assigning the model-only reason first and then recomputing an
-    # overlap mask would also select those newly populated rows, duplicating
-    # the token. Preserve rule-reason order and de-duplicate defensively.
+    # Add the model reason exactly once. Preserve actionable rule reasons;
+    # weak or unvalidated heuristics live in separate review/context fields.
     def _with_model_reason(existing: str) -> str:
         tokens = list(dict.fromkeys(
             token.strip()
@@ -169,5 +219,9 @@ def merge_detector_outputs(
             ("ISOLATION_FOREST", bool(model)),
         ) if active)
         for rule, model in zip(out["rule_alert"], out["model_alert"])
+    ]
+    out["review_sources"] = [
+        "PORT_SCAN_REVIEW" if bool(review) else ""
+        for review in out["review_alert"]
     ]
     return out
