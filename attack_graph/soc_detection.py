@@ -146,9 +146,22 @@ def merge_detector_outputs(
 
     model_flags = out["model_alert"].fillna(False).astype(bool)
     out["alert"] = out["rule_alert"] | model_flags
-    reasons.loc[model_flags & reasons.eq("")] = "ISOLATION_FOREST_ANOMALY"
-    both = model_flags & reasons.ne("")
-    reasons.loc[both] = reasons.loc[both] + ";ISOLATION_FOREST_ANOMALY"
+
+    # Add the model reason exactly once. Do this in one pass over model-alert
+    # rows: assigning the model-only reason first and then recomputing an
+    # overlap mask would also select those newly populated rows, duplicating
+    # the token. Preserve rule-reason order and de-duplicate defensively.
+    def _with_model_reason(existing: str) -> str:
+        tokens = list(dict.fromkeys(
+            token.strip()
+            for token in str(existing).split(";")
+            if token.strip()
+        ))
+        if "ISOLATION_FOREST_ANOMALY" not in tokens:
+            tokens.append("ISOLATION_FOREST_ANOMALY")
+        return ";".join(tokens)
+
+    reasons.loc[model_flags] = reasons.loc[model_flags].map(_with_model_reason)
     out["detection_reasons"] = reasons
     out["alert_sources"] = [
         ";".join(name for name, active in (
