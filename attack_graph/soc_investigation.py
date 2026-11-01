@@ -1058,7 +1058,7 @@ class SOCInvestigationOrchestrator:
         r = set(reasons)
         review = set(review_reasons or [])
         if "BRUTE_FORCE_PATTERN" in r:
-            return "Repeated authentication-service flow pattern requiring validation"
+            return "Repeated authentication-related flow pattern requiring validation"
         if "PORT_SCAN" in review:
             return "Port-scan review candidate"
         if "ISOLATION_FOREST_ANOMALY" in r:
@@ -2036,6 +2036,23 @@ def run_soc_investigation_from_events(
             {"name": "evidence_backed_reporting", "status": "completed", "output": "incident_investigation_report.md"},
         ],
         "pipeline_context": pipeline_context or {},
+        "incident_formation_policy": {
+            "forming_relations": {
+                "same_source_temporal": {"max_gap_seconds": 60},
+                "host_pivot": {"max_gap_seconds": 120},
+            },
+            "context_only_relations": [
+                "same_target_temporal",
+                "same_service_temporal",
+            ],
+            "max_campaign_duration_seconds": 900,
+            "minimum_events_per_incident": 2,
+            "retained_singleton_reasons": [
+                "BRUTE_FORCE_PATTERN",
+                "LEGACY_EVENT_IMPORT",
+            ],
+            "unassigned_event_count": unassigned_event_count,
+        },
         "counts": {
             "dataset_flows": (pipeline_context or {}).get("ingestion", {}).get("rows_loaded"),
             "alerts": alert_flow_count,
