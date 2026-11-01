@@ -318,11 +318,17 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if missing:
         raise ValueError(f"Missing benchmark preprocessing columns: {sorted(set(missing))}")
 
-    # Deduplicate on the benchmark's 78 columns (69 final + 8 constants + Label).
-    # Metadata columns are deliberately excluded so the deduplication semantics
-    # match the no-metadata preprocessing notebook.
+    # The benchmark Parquet verifier preserves the notebook's feature-only
+    # deduplication for historical reproduction. The metadata SOC path must
+    # retain distinct hosts, ports and timestamps even when feature vectors
+    # match, otherwise repeated activity and graph pivots disappear.
     raw_numeric = BENCHMARK_FEATURES + sorted(CONSTANT_FEATURES)
-    dedup_columns = [c for c in raw_numeric if c in work.columns] + ["label"]
+    metadata_columns = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port"]
+    dedup_columns = (
+        [c for c in raw_numeric if c in work.columns]
+        + [c for c in metadata_columns if c in work.columns]
+        + ["label"]
+    )
     before = len(work)
     work = work.drop_duplicates(subset=dedup_columns, keep="first").reset_index(drop=True)
     print(f"Rows before deduplication: {before:,}")
