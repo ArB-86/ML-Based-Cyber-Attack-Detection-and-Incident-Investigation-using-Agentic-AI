@@ -791,14 +791,9 @@ class SOCInvestigationOrchestrator:
 
 
 class IncidentEvidenceTools:
-    """Read-only tools exposed to the investigation agent."""
+    """Read-only, evidence-scoped tools available to the investigation agent."""
 
-    def __init__(
-        self,
-        incidents: list[dict[str, Any]],
-        events: pd.DataFrame,
-        graph: nx.DiGraph,
-    ):
+    def __init__(self, incidents: list[dict[str, Any]], events: pd.DataFrame, graph: nx.DiGraph):
         self.incidents = {item["incident_id"]: item for item in incidents}
         self.events = {str(row["event_id"]): row.to_dict() for _, row in events.iterrows()}
         self.graph = graph
@@ -831,17 +826,13 @@ class IncidentEvidenceTools:
 
     def get_timeline(self, incident_id: str) -> list[dict[str, Any]]:
         incident = self.get_incident(incident_id)
-        return [
-            self.get_event(event_id)
-            for event_id in incident["event_ids"]
-        ]
+        return [self.get_event(event_id) for event_id in incident["event_ids"]]
 
     def get_graph_neighborhood(self, incident_id: str) -> dict[str, Any]:
         incident = self.get_incident(incident_id)
         incident_node = f"incident:{incident_id}"
         if incident_node not in self.graph:
             raise KeyError(f"Incident graph node is missing: {incident_id}")
-
         neighborhood = []
         for event_node in self.graph.successors(incident_node):
             for neighbor in set(self.graph.predecessors(event_node)) | set(self.graph.successors(event_node)):
@@ -853,7 +844,6 @@ class IncidentEvidenceTools:
                     "node_type": str(attrs.get("node_type", "unknown")),
                     "label": str(attrs.get("label", neighbor)),
                 })
-
         edges = []
         members = {f"event:{event_id}" for event_id in incident["event_ids"]}
         for source, target, attrs in self.graph.edges(data=True):
@@ -863,6 +853,7 @@ class IncidentEvidenceTools:
                     "to": str(target),
                     "relation": str(attrs.get("relations", attrs.get("relation", ""))),
                     "gap_seconds": attrs.get("gap_seconds"),
+                    "overlap_seconds": attrs.get("overlap_seconds"),
                     "pivot_host": attrs.get("pivot_host"),
                     "shared_entity": attrs.get("shared_entity"),
                 })
@@ -889,60 +880,192 @@ class IncidentEvidenceTools:
                 if source:
                     by_source.setdefault(source, []).append(event_id)
         return {
-            "reason_to_event_ids": {
-                key: sorted(set(value)) for key, value in sorted(by_reason.items())
-            },
-            "source_to_event_ids": {
-                key: sorted(set(value)) for key, value in sorted(by_source.items())
-            },
+            "reason_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_reason.items())},
+            "source_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_source.items())},
         }
+
+    def get_host_activity(self, incident_id: str, host_ip: str) -> list[dict[str, Any]]:
+        incident = self.get_incident(incident_id)
+        return [
+            self.get_event(event_id)
+            for event_id in incident["event_ids"]
+            if str(self.events[event_id].get("src_ip")) == host_ip
+            or str(self.events[event_id].get("dst_ip")) == host_ip
+        ]
+
+    def get_service_activity(
+        self,
+        incident_id: str,
+        destination_port: int,
+        protocol: str | None = None,
+    ) -> list[dict[str, Any]]:
+        incident = self.get_incident(incident_id)
+        if not 0 <= int(destination_port) <= 65535:
+            raise ValueError("destination_port must be between 0 and 65535.")
+        matches = []
+        for event_id in incident["event_ids"]:
+            event = self.events[event_id]
+            ports = event.get("dst_ports", [])
+            if isinstance(ports, str):
+                try:
+                    import ast
+                    ports = ast.literal_eval(ports)
+                except (SyntaxError, ValueError):
+                    ports = []
+            if not isinstance(ports, (list, tuple, set)):
+                ports = []
+            port_match = int(destination_port) in {
+                int(port) for port in ports if str(port).isdigit()
+            }
+            protocol_match = protocol is None or str(event.get("protocol")) == str(protocol)
+            if port_match and protocol_match:
+                matches.append(self.get_event(event_id))
+        return matches
+
+    def get_correlated_events(
+        self,
+        incident_id: str,
+        event_id: str | None = None,
+        relation_contains: str | None = None,
+    ) -> list[dict[str, Any]]:
+        incident = self.get_incident(incident_id)
+        member_nodes = {f"event:{value}" for value in incident["event_ids"]}
+        if event_id is not None and event_id not in incident["event_ids"]:
+            raise ValueError(f"event_id {event_id} does not belong to {incident_id}.")
+        matches = []
+        for source, target, attrs in self.graph.edges(data=True):
+            if source not in member_nodes or target not in member_nodes:
+                continue
+            if event_id is not None and event_id not in {
+                source.removeprefix("event:"), target.removeprefix("event:")
+            }:
+                continue
+            relation = str(attrs.get("relations", attrs.get("relation", "")))
+            if relation_contains and relation_contains not in relation:
+                continue
+            matches.append({
+                "from_event": source.removeprefix("event:"),
+                "to_event": target.removeprefix("event:"),
+                "relation": relation,
+                "gap_seconds": attrs.get("gap_seconds"),
+                "overlap_seconds": attrs.get("overlap_seconds"),
+                "shared_entity": attrs.get("shared_entity"),
+                "pivot_host": attrs.get("pivot_host"),
+            })
+        return matches
 
 
 class AgenticInvestigationAgent:
-    """Execute an auditable, tool-driven investigation plan.
+    """Execute a fixed evidence plan plus one bounded LLM-directed tool round.
 
-    A project-specific LLM reasoner can be injected without coupling this
-    orchestration layer to a model server or changing its runtime settings.
-    Without a reasoner, the agent emits a deterministic evidence synthesis.
+    The optional reasoner receives evidence and a read-only tool catalogue. It
+    may return plain text or a structured dictionary with tool_calls, findings
+    and narrative. Only allowlisted tools and incident-scoped event IDs can be
+    used. No arbitrary code or host actions are exposed to the model.
     """
+
+    TOOL_CATALOG = [
+        {
+            "name": "get_event",
+            "description": "Retrieve full flow and detector provenance for one incident event.",
+            "arguments": {"event_id": "string"},
+        },
+        {
+            "name": "get_host_activity",
+            "description": "Retrieve events in this incident where a host is source or destination.",
+            "arguments": {"incident_id": "string", "host_ip": "string"},
+        },
+        {
+            "name": "get_service_activity",
+            "description": "Retrieve events in this incident targeting a destination port.",
+            "arguments": {"incident_id": "string", "destination_port": "integer", "protocol": "optional string"},
+        },
+        {
+            "name": "get_correlated_events",
+            "description": "Inspect exact event-to-event graph relationships and pivots.",
+            "arguments": {"incident_id": "string", "event_id": "optional string", "relation_contains": "optional string"},
+        },
+    ]
 
     def __init__(self, tools: IncidentEvidenceTools, reasoner=None):
         self.tools = tools
         self.reasoner = reasoner
+        self.available_tools = {
+            "get_event": self.tools.get_event,
+            "get_host_activity": self.tools.get_host_activity,
+            "get_service_activity": self.tools.get_service_activity,
+            "get_correlated_events": self.tools.get_correlated_events,
+        }
 
-    def investigate(self, incident_id: str) -> dict[str, Any]:
-        tool_calls: list[dict[str, Any]] = []
+    @staticmethod
+    def _decode_reasoner_response(response: Any) -> dict[str, Any]:
+        if isinstance(response, dict):
+            return response
+        if isinstance(response, str):
+            stripped = response.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    decoded = json.loads(stripped)
+                    if isinstance(decoded, dict):
+                        return decoded
+                except json.JSONDecodeError:
+                    pass
+            return {"narrative": response}
+        return {"narrative": str(response)}
 
-        def execute(name: str, arguments: dict[str, Any], function):
+    def _record_call(
+        self,
+        trace: list[dict[str, Any]],
+        name: str,
+        arguments: dict[str, Any],
+        function,
+    ) -> Any:
+        try:
             result = function(**arguments)
-            tool_calls.append({
+            trace.append({
                 "tool": name,
                 "arguments": arguments,
+                "status": "success",
                 "result_summary": self._summarize(name, result),
                 "evidence_refs": self._evidence_refs(name, result),
             })
             return result
+        except Exception as exc:
+            trace.append({
+                "tool": name,
+                "arguments": arguments,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "evidence_refs": [],
+            })
+            return None
 
-        incident = execute(
-            "get_incident",
-            {"incident_id": incident_id},
-            self.tools.get_incident,
+    def investigate(self, incident_id: str) -> dict[str, Any]:
+        trace: list[dict[str, Any]] = []
+        incident = self._record_call(
+            trace, "get_incident", {"incident_id": incident_id}, self.tools.get_incident
         )
-        timeline = execute(
-            "get_timeline",
-            {"incident_id": incident_id},
-            self.tools.get_timeline,
+        timeline = self._record_call(
+            trace, "get_timeline", {"incident_id": incident_id}, self.tools.get_timeline
         )
-        graph = execute(
-            "get_graph_neighborhood",
-            {"incident_id": incident_id},
+        graph = self._record_call(
+            trace, "get_graph_neighborhood", {"incident_id": incident_id},
             self.tools.get_graph_neighborhood,
         )
-        detections = execute(
-            "get_detection_evidence",
-            {"incident_id": incident_id},
+        detections = self._record_call(
+            trace, "get_detection_evidence", {"incident_id": incident_id},
             self.tools.get_detection_evidence,
         )
+        if incident is None or timeline is None or graph is None or detections is None:
+            return {
+                "agent": "AgenticInvestigationAgent",
+                "mode": "tool_assisted",
+                "status": "partial_failure",
+                "plan": ["retrieve_incident_context", "inspect_timeline", "inspect_graph", "inspect_detector_provenance"],
+                "tool_calls": trace,
+                "findings": [],
+                "narrative": "Investigation could not retrieve all required evidence. Analyst review is required.",
+            }
 
         claims: list[dict[str, Any]] = []
         for reason, event_ids in detections["reason_to_event_ids"].items():
@@ -951,40 +1074,34 @@ class AgenticInvestigationAgent:
                 "evidence_event_ids": event_ids,
                 "evidence_edges": [],
                 "confidence": "high" if len(event_ids) >= 2 else "medium",
+                "source": "detector_provenance",
             })
 
         analysis = incident["graph_analysis"]
         if analysis["max_source_fanout"] > 1 and analysis["top_sources"]:
             lead = analysis["top_sources"][0]
             claims.append({
-                "claim": (
-                    f"Source {lead['ip']} contacted {lead['unique_targets']} "
-                    "distinct destinations within this incident."
-                ),
+                "claim": f"Source {lead['ip']} contacted {lead['unique_targets']} distinct destinations within this incident.",
                 "evidence_event_ids": list(lead["event_ids"]),
                 "evidence_edges": [],
                 "confidence": "medium",
+                "source": "graph_fanout",
             })
         if analysis["max_target_fanin"] > 1 and analysis["top_targets"]:
             lead = analysis["top_targets"][0]
             claims.append({
-                "claim": (
-                    f"Destination {lead['ip']} received traffic from "
-                    f"{lead['unique_sources']} distinct sources."
-                ),
+                "claim": f"Destination {lead['ip']} received traffic from {lead['unique_sources']} distinct sources.",
                 "evidence_event_ids": list(lead["event_ids"]),
                 "evidence_edges": [],
                 "confidence": "medium",
+                "source": "graph_convergence",
             })
-        pivot_edges = [
-            edge for edge in graph["event_edges"]
-            if "host_pivot" in edge["relation"]
-        ]
+        pivot_edges = [edge for edge in graph["event_edges"] if "host_pivot" in edge["relation"]]
         for edge in pivot_edges:
             claims.append({
                 "claim": (
-                    f"Host {edge['pivot_host']} was targeted and subsequently "
-                    "initiated another correlated connection; this is a pivot lead."
+                    f"Host {edge['pivot_host']} was targeted and subsequently initiated "
+                    "another correlated connection; this is a pivot lead."
                 ),
                 "evidence_event_ids": [
                     edge["from"].removeprefix("event:"),
@@ -992,47 +1109,146 @@ class AgenticInvestigationAgent:
                 ],
                 "evidence_edges": [edge],
                 "confidence": "medium",
+                "source": "host_pivot",
             })
 
-        result = {
+        narrative = (
+            f"{incident['title']}. The candidate contains {len(timeline)} correlated events "
+            f"over {incident['start_time']} to {incident['end_time']}. "
+            f"Observed detection signals: {', '.join(incident['detection_reasons']) or 'none recorded'}. "
+            f"Graph evidence contains {len(graph['event_edges'])} event-to-event relationships. "
+            "Treat this as a candidate incident pending validation against endpoint, identity and service telemetry."
+        )
+        model_findings: list[dict[str, Any]] = []
+        model_response: dict[str, Any] = {}
+
+        if self.reasoner is not None:
+            first_response = self._decode_reasoner_response(self.reasoner({
+                "task": (
+                    "Act as a SOC analyst. Inspect the supplied evidence, identify what is "
+                    "still unknown, and request only relevant read-only tools. Do not assert "
+                    "compromise from flow metadata alone. Return JSON with tool_calls (max 5), "
+                    "preliminary_findings and narrative."
+                ),
+                "incident": incident,
+                "timeline": timeline,
+                "graph": graph,
+                "detections": detections,
+                "deterministic_findings": claims,
+                "tool_catalog": self.TOOL_CATALOG,
+                "response_contract": {
+                    "tool_calls": [{"name": "get_event|get_host_activity|get_service_activity|get_correlated_events", "arguments": {}}],
+                    "preliminary_findings": [{"claim": "string", "evidence_event_ids": ["event id"], "confidence": "low|medium|high"}],
+                    "narrative": "string",
+                },
+            }))
+            model_response = first_response
+            requested_tools = first_response.get("tool_calls", [])
+            if not isinstance(requested_tools, list):
+                requested_tools = []
+
+            tool_results = []
+            allowed_event_ids = set(incident["event_ids"])
+            for request in requested_tools[:5]:
+                if not isinstance(request, dict):
+                    continue
+                name = request.get("name", request.get("tool"))
+                arguments = request.get("arguments", {})
+                if name not in self.available_tools or not isinstance(arguments, dict):
+                    trace.append({
+                        "tool": str(name),
+                        "status": "rejected",
+                        "error": "Tool is not allowlisted or arguments are invalid.",
+                        "evidence_refs": [],
+                    })
+                    continue
+                arguments = dict(arguments)
+                if name == "get_event":
+                    requested_id = str(arguments.get("event_id", ""))
+                    if requested_id not in allowed_event_ids:
+                        trace.append({
+                            "tool": name,
+                            "arguments": arguments,
+                            "status": "rejected",
+                            "error": "Event is outside this incident's scope.",
+                            "evidence_refs": [],
+                        })
+                        continue
+                if name != "get_event":
+                    arguments.setdefault("incident_id", incident_id)
+                result = self._record_call(trace, name, arguments, self.available_tools[name])
+                if result is not None:
+                    tool_results.append({"tool": name, "arguments": arguments, "result": result})
+
+            if tool_results:
+                model_response = self._decode_reasoner_response(self.reasoner({
+                    "task": (
+                        "Complete the SOC investigation using only this evidence. Return a concise "
+                        "incident explanation, findings with exact event IDs, uncertainty/caveats, "
+                        "and recommended analyst actions. Do not invent users, process execution, "
+                        "successful logins, exfiltration or business impact."
+                    ),
+                    "incident": incident,
+                    "initial_evidence": {"timeline": timeline, "graph": graph, "detections": detections},
+                    "deterministic_findings": claims,
+                    "additional_tool_results": tool_results,
+                }))
+
+            if model_response.get("narrative"):
+                narrative = str(model_response["narrative"])
+            preliminary = model_response.get(
+                "findings", model_response.get("preliminary_findings", [])
+            )
+            if isinstance(preliminary, list):
+                for finding in preliminary:
+                    if not isinstance(finding, dict):
+                        continue
+                    event_refs = [str(value) for value in finding.get("evidence_event_ids", [])]
+                    if event_refs and set(event_refs).issubset(allowed_event_ids):
+                        model_findings.append({
+                            "claim": str(finding.get("claim", finding.get("finding", ""))),
+                            "evidence_event_ids": event_refs,
+                            "evidence_edges": [],
+                            "confidence": str(finding.get("confidence", "low")).lower(),
+                            "source": "llm_evidence_validated",
+                        })
+                    else:
+                        trace.append({
+                            "tool": "validate_model_finding",
+                            "status": "rejected",
+                            "error": "Finding lacks valid event references or cites events outside this incident.",
+                            "evidence_refs": [],
+                        })
+
+        all_findings = claims + model_findings
+        return {
             "agent": "AgenticInvestigationAgent",
-            "mode": "tool_assisted",
+            "mode": "tool_assisted_llm" if self.reasoner is not None else "tool_assisted_deterministic",
             "status": "completed",
             "plan": [
                 "retrieve_incident_context",
                 "inspect_chronological_event_timeline",
                 "inspect_correlated_graph_neighborhood",
                 "cross_check_detection_provenance",
+                "select_additional_read_only_tools",
+                "validate_finding_event_references",
                 "synthesise_evidence_linked_findings",
             ],
-            "tool_calls": tool_calls,
-            "findings": claims,
+            "tool_calls": trace,
+            "findings": all_findings,
+            "model_findings_accepted": len(model_findings),
+            "model_findings_rejected": sum(
+                call.get("tool") == "validate_model_finding" for call in trace
+            ),
             "attack_hypotheses": incident.get("attack_hypotheses", []),
             "recommended_actions": list(incident.get("recommended_actions", [])),
-            "narrative": (
-                f"{incident['title']}. The candidate contains {len(timeline)} correlated "
-                f"events over {incident['start_time']} to {incident['end_time']}. "
-                f"Observed detection signals: {', '.join(incident['detection_reasons']) or 'none recorded'}. "
-                f"Graph evidence contains {len(graph['event_edges'])} event-to-event relationships. "
-                "Treat the result as a candidate incident pending validation against endpoint, "
-                "identity and service telemetry."
-            ),
+            "narrative": narrative,
         }
-        if self.reasoner is not None:
-            result["narrative"] = self.reasoner({
-                "incident": incident,
-                "timeline": timeline,
-                "graph": graph,
-                "detections": detections,
-                "evidence_linked_findings": claims,
-            })
-            result["mode"] = "tool_assisted_llm"
-        return result
 
     @staticmethod
     def _summarize(name: str, result: Any) -> dict[str, Any]:
-        if name == "get_timeline":
-            return {"event_count": len(result)}
+        if isinstance(result, list):
+            return {"record_count": len(result)}
         if name == "get_graph_neighborhood":
             return {
                 "event_edge_count": len(result["event_edges"]),
@@ -1043,29 +1259,33 @@ class AgenticInvestigationAgent:
                 "detection_reason_count": len(result["reason_to_event_ids"]),
                 "alert_source_count": len(result["source_to_event_ids"]),
             }
-        return {
-            "incident_id": result["incident_id"],
-            "event_count": len(result["event_ids"]),
-            "severity": result["triage"]["severity"],
-        }
+        if isinstance(result, dict) and "incident_id" in result:
+            return {
+                "incident_id": result["incident_id"],
+                "event_count": len(result.get("event_ids", [])),
+                "severity": result.get("triage", {}).get("severity"),
+            }
+        return {"record_count": len(result) if hasattr(result, "__len__") else 1}
 
     @staticmethod
     def _evidence_refs(name: str, result: Any) -> list[str]:
-        if name == "get_timeline":
-            return [str(item["event_id"]) for item in result]
-        if name == "get_graph_neighborhood":
+        if isinstance(result, list):
             return [
-                item.removeprefix("event:")
-                for item in result["member_event_nodes"]
+                str(item["event_id"])
+                for item in result
+                if isinstance(item, dict) and item.get("event_id") is not None
             ]
+        if name == "get_graph_neighborhood":
+            return [item.removeprefix("event:") for item in result["member_event_nodes"]]
         if name == "get_detection_evidence":
             return sorted({
                 event_id
                 for event_ids in result["reason_to_event_ids"].values()
                 for event_id in event_ids
             })
-        return list(result.get("event_ids", []))
-
+        if isinstance(result, dict):
+            return list(result.get("event_ids", []))
+        return []
 
 def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: nx.DiGraph, path: Path) -> None:
     critical = sum(i["triage"]["severity"] == "CRITICAL" for i in incidents)
