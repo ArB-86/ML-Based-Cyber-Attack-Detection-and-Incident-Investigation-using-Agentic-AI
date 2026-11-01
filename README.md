@@ -72,7 +72,7 @@ All behavioural rules are computed independently of the CICIDS ground-truth `Lab
 
 | Rule | Default condition within a 5-minute bucket | Current policy tier |
 |---|---|---|
-| Brute-force pattern | At least 12 flows from one source to one destination on a common authentication port | Actionable rule candidate |
+| Brute-force pattern | At least 12 flows from one source to one destination on a configured authentication-related service port | Actionable rule candidate |
 | Port scan | One source probes at least 10 destination ports on one destination | Secondary analyst-review queue |
 | High source fan-out | One source communicates with at least 15 distinct destinations | Context only |
 | Horizontal scan | One source probes at least 10 distinct destinations on the same destination port | Context only |
