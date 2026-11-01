@@ -513,22 +513,24 @@ class IncidentTriageAgent:
 
 
 class IncidentFormationAgent:
-    """Turn the correlated event graph into stable candidate incident groups."""
+    """Form candidate incidents from the explicit event-correlation table."""
 
-    def __init__(self, graph: nx.DiGraph, events: pd.DataFrame):
-        self.graph = graph
+    def __init__(self, events: pd.DataFrame, correlations: pd.DataFrame):
         self.events = events
+        self.correlations = correlations
 
     def form(self) -> list[tuple[pd.Timestamp, set[str], pd.DataFrame]]:
-        event_nodes = {
-            node for node, attrs in self.graph.nodes(data=True)
-            if attrs.get("node_type") == "event"
-        }
+        event_nodes = {f"event:{event_id}" for event_id in self.events["event_id"].astype(str)}
         correlated = nx.Graph()
         correlated.add_nodes_from(event_nodes)
-        for source, target, attrs in self.graph.edges(data=True):
-            if source in event_nodes and target in event_nodes:
-                correlated.add_edge(source, target, **attrs)
+        known_ids = {node.removeprefix("event:") for node in event_nodes}
+        for _, edge in self.correlations.iterrows():
+            source_id, target_id = str(edge["from_event"]), str(edge["to_event"])
+            if source_id not in known_ids or target_id not in known_ids:
+                raise ValueError(
+                    f"Incident formation received an unknown event link: {source_id} -> {target_id}"
+                )
+            correlated.add_edge(f"event:{source_id}", f"event:{target_id}", **edge.to_dict())
 
         components = []
         for component in nx.connected_components(correlated):
@@ -542,9 +544,15 @@ class IncidentFormationAgent:
 
 class SOCInvestigationOrchestrator:
     """Coordinate graph analyst, threat hunter and incident triage stages."""
-    def __init__(self, events: pd.DataFrame, graph: nx.DiGraph):
+    def __init__(
+        self,
+        events: pd.DataFrame,
+        graph: nx.DiGraph,
+        correlations: pd.DataFrame,
+    ):
         self.events = events.copy().reset_index(drop=True)
         self.graph = graph
+        self.correlations = correlations.copy()
         self.graph_agent = GraphAnalystAgent(graph)
         scores = pd.to_numeric(self.events.get("mean_anomaly_score", pd.Series(index=self.events.index, dtype=float)), errors="coerce")
         if scores.notna().any():
@@ -555,7 +563,7 @@ class SOCInvestigationOrchestrator:
 
     def run(self) -> list[dict[str, Any]]:
         components = IncidentFormationAgent(
-            self.graph, self.events
+            self.events, self.correlations
         ).form()
         incidents = []
         for number, (_, component, rows) in enumerate(components, start=1):
@@ -1088,8 +1096,13 @@ def run_soc_investigation_from_events(
         raise ValueError("Event contract contains invalid timestamps.")
 
     events.to_csv(out / "attack_events.csv", index=False)
-    graph = build_soc_graph(events)
-    incidents = SOCInvestigationOrchestrator(events, graph).run() if not events.empty else []
+    correlations = EventCorrelationAgent(events, max_gap_seconds=300).correlate()
+    correlations.to_csv(out / "event_correlations.csv", index=False)
+    graph = build_soc_graph(events, correlations)
+    incidents = (
+        SOCInvestigationOrchestrator(events, graph, correlations).run()
+        if not events.empty else []
+    )
 
     evidence_tools = IncidentEvidenceTools(incidents, events, graph)
     agent = AgenticInvestigationAgent(evidence_tools, reasoner=reasoner)
@@ -1117,27 +1130,6 @@ def run_soc_investigation_from_events(
     if not evidence.empty:
         evidence = evidence.sort_values(["incident_risk_score", "start_time"], ascending=[False, True])
     evidence.to_csv(out / "incident_investigation.csv", index=False)
-
-    correlation_rows = []
-    event_nodes = {
-        node for node, attrs in graph.nodes(data=True)
-        if attrs.get("node_type") == "event"
-    }
-    for source, target, attrs in graph.edges(data=True):
-        if source in event_nodes and target in event_nodes:
-            correlation_rows.append({
-                "from_event": str(source).removeprefix("event:"),
-                "to_event": str(target).removeprefix("event:"),
-                "relation": str(attrs.get("relations", attrs.get("relation", ""))),
-                "gap_seconds": attrs.get("gap_seconds"),
-                "shared_entity": attrs.get("shared_entity"),
-                "pivot_host": attrs.get("pivot_host"),
-            })
-    correlations = pd.DataFrame(
-        correlation_rows,
-        columns=["from_event", "to_event", "relation", "gap_seconds", "shared_entity", "pivot_host"],
-    )
-    correlations.to_csv(out / "event_correlations.csv", index=False)
 
     # Persist the incident-level graph only after the incident nodes have been
     # attached to their member events.
