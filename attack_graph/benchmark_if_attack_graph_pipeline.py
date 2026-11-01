@@ -697,10 +697,44 @@ def run(
 
     # Specialist graph analyst, threat-hunting and triage stages coordinate
     # event formation, topology analysis and evidence-backed reporting.
+    pipeline_context = {
+        "ingestion": {
+            "input_files": list(CSV_ORDER),
+            "rows_loaded": int(len(df)),
+        },
+        "preprocessing": {
+            "feature_count": int(x.shape[1]),
+            "rows_after_metadata_preprocessing": int(len(df)),
+            "imputation_fit": "training partition only",
+            "metadata_preserved": ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol"],
+        },
+        "ml_detection": {
+            "algorithm": "IsolationForest",
+            "training_rows": int(len(train_idx)),
+            "benign_model_training_rows": int(model_training_sample),
+            "validation_benign_alert_budget": 0.05,
+            "model_alert_flows": int(df["model_alert"].sum()),
+            "threshold": float(active_threshold),
+        },
+        "behavioural_detection": {
+            "rule_alert_flows": int(df["rule_alert"].sum()),
+            "rules": sorted({
+                reason
+                for value in df["detection_reasons"].fillna("").astype(str)
+                for reason in value.split(";")
+                if reason and reason != "ISOLATION_FOREST_ANOMALY"
+            }),
+        },
+        "alert_fusion": {
+            "combined_alert_flows": int(df["alert"].sum()),
+            "model_and_rule_or_logic": True,
+        },
+    }
     events, graph, investigation_summary = run_soc_investigation(
         suspicious,
         out,
         reasoner=reasoner,
+        pipeline_context=pipeline_context,
     )
 
     # The SOC orchestrator owns graph persistence after incident nodes and
