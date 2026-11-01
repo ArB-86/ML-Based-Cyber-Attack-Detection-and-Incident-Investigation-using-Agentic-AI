@@ -884,6 +884,156 @@ def run(
     print(f"Elapsed seconds:          {time.time() - start:.2f}")
 
 
+def run_from_predictions(
+    predictions_path: str,
+    output_dir: str,
+    reasoner=None,
+) -> dict:
+    """Replay detector policy and SOC investigation using saved model scores.
+
+    This avoids refitting Isolation Forest when only behavioural-rule,
+    correlation or investigation logic has changed. The precomputed
+    predicted_anomaly column is treated as the immutable model output.
+    Ground-truth labels, if present, are preserved in the artefact but never
+    used for alert selection.
+    """
+    start = time.time()
+    source = Path(predictions_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Saved prediction file does not exist: {source}")
+
+    print(f"Loading saved model predictions: {source}")
+    df = pd.read_csv(source, low_memory=False, encoding="latin1")
+    df = _resolve_columns(df)
+
+    required = {"timestamp", "src_ip", "dst_ip", "protocol", "predicted_anomaly"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Saved predictions are missing required replay columns: "
+            f"{sorted(missing)}. A file with model-generated predicted_anomaly "
+            "flags is required; this mode does not retrain the model."
+        )
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Recompute behavioural tiers with the current policy, while reusing the
+    # original IF flags/scores and train/validation/test assignments.
+    df = merge_detector_outputs(df)
+    predictions_out = out / "cicids_if_predictions_with_metadata.csv"
+    df.to_csv(predictions_out, index=False)
+
+    suspicious = df[df["alert"]].copy()
+    suspicious_path = out / "suspicious_flows_with_metadata.csv"
+    suspicious.to_csv(suspicious_path, index=False)
+
+    review_only = df[df["review_candidate"] & ~df["alert"]].copy()
+    review_path = out / "review_candidates_with_metadata.csv"
+    review_only.to_csv(review_path, index=False)
+
+    split_counts = (
+        df["split"].astype(str).value_counts().to_dict()
+        if "split" in df.columns else {}
+    )
+    pipeline_context = {
+        "ingestion": {
+            "input_file": str(source),
+            "rows_loaded": int(len(df)),
+            "mode": "saved_prediction_replay",
+        },
+        "preprocessing": {
+            "mode": "reused_preprocessed_model_predictions",
+            "metadata_preserved": [
+                "timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol"
+            ],
+            "split_row_counts": {str(k): int(v) for k, v in split_counts.items()},
+        },
+        "ml_detection": {
+            "algorithm": "IsolationForest",
+            "model_refit": False,
+            "scores_reused": True,
+            "model_alert_flows": int(df["model_alert"].sum()),
+            "threshold_source": "stored predicted_anomaly flags",
+        },
+        "behavioural_detection": {
+            "rule_alert_flows": int(df["rule_alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "context_signal_flows": int(
+                df["context_signals"].fillna("").astype(str).ne("").sum()
+            ),
+            "actionable_rules": ["BRUTE_FORCE_PATTERN"],
+            "review_rules": ["PORT_SCAN"],
+            "context_only_rules": [
+                "HIGH_SOURCE_FANOUT",
+                "HORIZONTAL_SCAN",
+                "DISTRIBUTED_DOS_PATTERN",
+            ],
+            "review_output": review_path.name,
+            "policy_note": (
+                "CICIDS2017 validation-informed policy replay; weak heuristics "
+                "are context-only and port scan is review-only."
+            ),
+        },
+        "alert_fusion": {
+            "combined_alert_flows": int(df["alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "model_and_actionable_rule_or_logic": True,
+        },
+    }
+
+    events, graph, investigation_summary = run_soc_investigation(
+        suspicious,
+        out,
+        reasoner=reasoner,
+        pipeline_context=pipeline_context,
+    )
+    gexf_path = out / "attack_graph.gexf"
+    if not gexf_path.exists() or gexf_path.stat().st_size == 0:
+        raise RuntimeError("SOC orchestrator did not persist the incident attack graph.")
+
+    summary = {
+        "replay_mode": True,
+        "model_refit": False,
+        "source_predictions": str(source),
+        "rows_replayed": int(len(df)),
+        "model_alert_flows": int(df["model_alert"].sum()),
+        "behavioural_rule_alert_flows": int(df["rule_alert"].sum()),
+        "review_only_flows": int(len(review_only)),
+        "context_signal_flows": int(
+            df["context_signals"].fillna("").astype(str).ne("").sum()
+        ),
+        "combined_alert_flows": int(df["alert"].sum()),
+        "alert_flows_investigated": int(len(suspicious)),
+        "attack_events": int(len(events)),
+        "graph_nodes": int(graph.number_of_nodes()),
+        "graph_edges": int(graph.number_of_edges()),
+        "soc_investigation": investigation_summary,
+        "elapsed_seconds": round(time.time() - start, 2),
+        "note": (
+            "Isolation Forest was not retrained and its scores were not "
+            "re-evaluated. This run replays behavioural policy and SOC stages."
+        ),
+    }
+    (out / "pipeline_summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\nREPLAY COMPLETE")
+    print(f"Isolation Forest alerts reused: {df['model_alert'].sum():,}")
+    print(f"Actionable behavioural alerts:  {df['rule_alert'].sum():,}")
+    print(f"Port-scan review-only flows:    {len(review_only):,}")
+    print(f"Combined SOC alerts:            {df['alert'].sum():,}")
+    print(f"Alert flows investigated:       {len(suspicious):,}")
+    print(f"Candidate incidents:             {investigation_summary['incident_count']:,}")
+    print(f"Attack events:                   {len(events):,}")
+    print(f"Graph nodes:                     {graph.number_of_nodes():,}")
+    print(f"Graph edges:                     {graph.number_of_edges():,}")
+    print(f"Elapsed seconds:                 {time.time() - start:.2f}")
+    return summary
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
