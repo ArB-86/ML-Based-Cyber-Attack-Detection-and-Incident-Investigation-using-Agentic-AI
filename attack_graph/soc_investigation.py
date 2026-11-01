@@ -45,7 +45,7 @@ def build_soc_events(
         "src_ip", "dst_ip", "protocol", "attack_type", "flow_count",
         "mean_anomaly_score", "min_anomaly_score", "src_ports", "dst_ports",
         "unique_src_ports", "unique_dst_ports", "detection_reasons",
-        "alert_sources", "flow_row_ids",
+        "review_reasons", "context_signals", "alert_sources", "flow_row_ids",
     ]
     if event_gap_seconds < 0 or max_flows_per_event < 1:
         raise ValueError("Event gap must be non-negative and max_flows_per_event must be positive.")
@@ -88,6 +88,10 @@ def build_soc_events(
         work["detection_reasons"] = "UNSPECIFIED_DETECTION"
     if "alert_sources" not in work.columns:
         work["alert_sources"] = "UNSPECIFIED_ALERT_SOURCE"
+    if "review_reasons" not in work.columns:
+        work["review_reasons"] = ""
+    if "context_signals" not in work.columns:
+        work["context_signals"] = ""
 
     work = work.sort_values("timestamp", kind="stable")
     group_columns = ["src_ip", "dst_ip", "protocol"]
@@ -123,6 +127,8 @@ def build_soc_events(
     records: list[dict[str, Any]] = []
     for number, rows in enumerate(groups, start=1):
         reasons = _tokens(rows["detection_reasons"]) or {"UNSPECIFIED_DETECTION"}
+        review_reasons = _tokens(rows["review_reasons"])
+        context_signals = _tokens(rows["context_signals"])
         sources = _tokens(rows["alert_sources"])
         scores = pd.to_numeric(rows["anomaly_score"], errors="coerce")
         src_port_values = pd.to_numeric(rows["src_port"], errors="coerce").dropna()
@@ -147,6 +153,8 @@ def build_soc_events(
             "unique_src_ports": len(src_ports),
             "unique_dst_ports": len(dst_ports),
             "detection_reasons": ";".join(sorted(reasons)),
+            "review_reasons": ";".join(sorted(review_reasons)),
+            "context_signals": ";".join(sorted(context_signals)),
             "alert_sources": ";".join(sorted(sources)),
             "flow_row_ids": [str(value) for value in rows["_flow_row_id"].tolist()],
         })
@@ -365,6 +373,8 @@ def build_soc_graph(
             "protocol": str(event.get("protocol", "unknown")),
             "flow_count": int(event.get("flow_count", 0)),
             "detection_reasons": str(event.get("detection_reasons", "")),
+            "review_reasons": str(event.get("review_reasons", "")),
+            "context_signals": str(event.get("context_signals", "")),
             "alert_sources": str(event.get("alert_sources", "")),
         }
         score = event.get("mean_anomaly_score")
@@ -518,22 +528,22 @@ class ThreatHuntingAgent:
     """Map only observable behaviours to ATT&CK candidate techniques."""
     @staticmethod
     def analyse(rows: pd.DataFrame, graph_data: dict[str, Any]) -> list[dict[str, str]]:
-        reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
+        detection_reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
+        review_reasons = _tokens(rows.get("review_reasons", pd.Series(dtype=object)))
+        reasons = detection_reasons | review_reasons
         hypotheses = []
         event_ids = rows["event_id"].astype(str)
-        reasons_by_event = rows.get(
+        review_by_event = rows.get(
+            "review_reasons", pd.Series("", index=rows.index)
+        ).fillna("").astype(str)
+        brute_by_event = rows.get(
             "detection_reasons", pd.Series("", index=rows.index)
         ).fillna("").astype(str)
         scan_ids = event_ids[
-            reasons_by_event.str.contains(
-                r"PORT_SCAN|HORIZONTAL_SCAN|HIGH_SOURCE_FANOUT", regex=True
-            )
-        ].tolist()
-        dos_ids = event_ids[
-            reasons_by_event.str.contains("DISTRIBUTED_DOS_PATTERN", regex=False)
+            review_by_event.str.contains(r"(?:^|;)PORT_SCAN(?:;|$)", regex=True)
         ].tolist()
         brute_ids = event_ids[
-            reasons_by_event.str.contains("BRUTE_FORCE_PATTERN", regex=False)
+            brute_by_event.str.contains("BRUTE_FORCE_PATTERN", regex=False)
         ].tolist()
         pivot_ids = sorted({
             event_id
@@ -541,26 +551,17 @@ class ThreatHuntingAgent:
             if "host_pivot" in edge["relation"]
             for event_id in (edge["from_event"], edge["to_event"])
         })
-        if reasons.intersection({"PORT_SCAN", "HORIZONTAL_SCAN", "HIGH_SOURCE_FANOUT"}):
+        if "PORT_SCAN" in review_reasons:
             hypotheses.append({
                 "technique_id": "T1046", "technique": "Network Service Discovery",
-                "confidence": "medium",
-                "evidence": "A source probed multiple destination services or hosts in a bounded time window.",
+                "confidence": "low",
+                "evidence": "A source-to-destination flow pattern matched the secondary port-scan review heuristic.",
                 "evidence_event_ids": scan_ids,
-                "caveat": "Check authorised scanner schedules, firewall and IDS telemetry.",
+                "caveat": "This rule is not an actionable detection by itself; validate scanner authorization and corroborate with firewall/IDS telemetry.",
             })
-        if "DISTRIBUTED_DOS_PATTERN" in reasons or graph_data["max_target_fanin"] >= 15:
-            hypotheses.append({
-                "technique_id": "T1498", "technique": "Network Denial of Service",
-                "confidence": "medium",
-                "evidence": "A destination received flows from many distinct sources in a bounded interval.",
-                "evidence_event_ids": dos_ids or [
-                    event_id
-                    for lead in graph_data["top_targets"][:1]
-                    for event_id in lead["event_ids"]
-                ],
-                "caveat": "Flow metadata alone does not establish service impact or malicious intent.",
-            })
+        # The former DDoS heuristic and raw destination convergence remain
+        # contextual telemetry only; flow metadata alone cannot establish
+        # service impact or malicious intent. Do not map them to T1498.
         if "BRUTE_FORCE_PATTERN" in reasons:
             hypotheses.append({
                 "technique_id": "T1110", "technique": "Brute Force",
@@ -747,6 +748,8 @@ class SOCInvestigationOrchestrator:
                 "event_ids": ids,
                 "total_flows": int(rows["flow_count"].sum()),
                 "detection_reasons": reasons,
+                "review_reasons": sorted(_tokens(rows.get("review_reasons", pd.Series(dtype=object)))),
+                "context_signals": sorted(_tokens(rows.get("context_signals", pd.Series(dtype=object)))),
                 "graph_analysis": graph_data,
                 "attack_hypotheses": hypotheses,
                 "triage": triage,
@@ -757,6 +760,8 @@ class SOCInvestigationOrchestrator:
                         "destination": str(row["dst_ip"]), "protocol": str(row["protocol"]),
                         "flows": int(row["flow_count"]), "ports": row.get("dst_ports", []),
                         "evidence": str(row.get("detection_reasons", "")),
+                        "review_reasons": str(row.get("review_reasons", "")),
+                        "context_signals": str(row.get("context_signals", "")),
                     }
                     for _, row in rows.sort_values(["start_time", "end_time"]).iterrows()
                 ],
@@ -1473,7 +1478,9 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             f"**Confidence:** {triage['confidence']}  ",
             f"**Window:** {item['start_time']} to {item['end_time']} ({item['duration_seconds']:.1f}s)", "",
             f"**Observed scope:** {len(item['event_ids'])} events, {item['total_flows']:,} flows, {g['unique_sources']} sources and {g['unique_targets']} destinations.",
-            f"**Detection evidence:** {', '.join(item['detection_reasons']) or 'No behavioural rule token'}.",
+            f"**Detection evidence:** {', '.join(item['detection_reasons']) or 'No actionable behavioural rule token'}.",
+            f"**Secondary review indicators:** {', '.join(item.get('review_reasons', [])) or 'None'}.",
+            f"**Context-only signals:** {', '.join(item.get('context_signals', [])) or 'None'}.",
             f"**Graph structure:** {g['graph_event_links']} event-to-event links, density {g.get('graph_density', 0.0):.4f}, {g['unique_services']} destination services, pivot hosts: {', '.join(g['pivot_hosts']) or 'none observed'}.",
             f"**Graph relationship types:** {relation_breakdown}.",
             f"**Risk score component contributions:** {risk_breakdown}.", "",
