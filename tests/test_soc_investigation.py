@@ -4,6 +4,7 @@ import pandas as pd
 
 from attack_graph.event_builder import EventConfig, build_attack_events
 from attack_graph.soc_detection import BehaviourThresholds, detect_behavioral_alerts, merge_detector_outputs
+from attack_graph.pipeline import PipelineConfig, run_pipeline
 from attack_graph.soc_investigation import (
     EventCorrelationAgent,
     IncidentFormationAgent,
@@ -501,4 +502,41 @@ def test_port_scan_is_secondary_review_candidate_not_primary_alert():
     assert not result["model_alert"].any()
     assert not result["alert"].any()
     assert result["review_reasons"].str.contains("PORT_SCAN").all()
+
+def test_saved_prediction_replay_skips_model_refit(tmp_path):
+    rows = pd.DataFrame([
+        {
+            "timestamp": _time(0, second),
+            "src_ip": "10.0.0.1",
+            "dst_ip": "10.0.0.9",
+            "src_port": 40000 + second,
+            "dst_port": 22,
+            "protocol": 6,
+            "anomaly_score": 0.5,
+            "predicted_anomaly": False,
+            "split": "test",
+            "label": "BENIGN",
+        }
+        for second in range(12)
+    ])
+    predictions = tmp_path / "saved_predictions.csv"
+    output = tmp_path / "soc_replay"
+    rows.to_csv(predictions, index=False)
+
+    run_pipeline(PipelineConfig(
+        output_dir=str(output),
+        reuse_predictions=str(predictions),
+    ))
+
+    summary = json.loads(
+        (output / "pipeline_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["replay_mode"] is True
+    assert summary["model_refit"] is False
+    assert summary["model_alert_flows"] == 0
+    assert summary["behavioural_rule_alert_flows"] == 12
+    assert summary["combined_alert_flows"] == 12
+    assert summary["soc_investigation"]["incident_count"] == 1
+    assert (output / "review_candidates_with_metadata.csv").exists()
+    assert (output / "incident_investigation_report.md").exists()
 
