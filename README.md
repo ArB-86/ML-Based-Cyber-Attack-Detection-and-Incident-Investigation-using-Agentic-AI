@@ -88,6 +88,17 @@ The priority score combines detection-rule diversity, event persistence, source 
 
 The default mode is a deterministic, tool-assisted baseline. The existing local LLM/Ollama reasoner can be passed as a Python callback in `PipelineConfig(reasoner=...)`; the callback receives an evidence bundle and tool catalogue, and should return structured JSON containing `tool_calls`, `findings` and `narrative` to enable model-directed tool use. Plain text responses are treated as narrative-only. This keeps your model/server/runtime configuration separate from the SOC orchestration code. No Ollama server/model settings are changed by this refactor.
 
+To run the canonical dataset pipeline with the reasoner function you already use for Ollama, pass that existing callable to the configuration instead of starting a second workflow:
+
+    from attack_graph.pipeline import PipelineConfig, run_pipeline
+    run_pipeline(PipelineConfig(
+        data_dir=r"D:\MAJOR PROJECT\cicids_metadata\generated_flows",
+        output_dir="soc_output",
+        reasoner=your_existing_ollama_reasoner,
+    ))
+
+The callback contract is `reasoner(context: dict) -> str | dict`. For model-directed tool use, return a dictionary with `tool_calls` (up to five allowlisted calls), `findings` (each with valid `evidence_event_ids`) and `narrative`. A plain string is accepted as narrative-only.
+
 ## Output artefacts
 
 | File | Contents |
