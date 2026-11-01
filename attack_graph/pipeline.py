@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .benchmark_if_attack_graph_pipeline import run as _run_dataset_pipeline
 
@@ -15,6 +16,7 @@ class PipelineConfig:
     output_dir: str = "soc_output"
     benchmark_parquet: str | None = None
     verify_only: bool = False
+    reasoner: Callable[[dict[str, Any]], str | dict[str, Any]] | None = None
 
 
 def run_pipeline(config: PipelineConfig) -> None:
@@ -38,6 +40,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         output_dir=config.output_dir,
         benchmark_parquet=config.benchmark_parquet,
         verify_only=config.verify_only,
+        reasoner=config.reasoner,
     )
 
 
