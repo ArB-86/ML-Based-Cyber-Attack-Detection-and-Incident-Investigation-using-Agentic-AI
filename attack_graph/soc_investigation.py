@@ -1247,6 +1247,13 @@ class AgenticInvestigationAgent:
 
     @staticmethod
     def _summarize(name: str, result: Any) -> dict[str, Any]:
+        if name == "get_event" and isinstance(result, dict):
+            return {
+                "event_id": result.get("event_id"),
+                "source": result.get("src_ip"),
+                "destination": result.get("dst_ip"),
+                "detection_reasons": result.get("detection_reasons"),
+            }
         if isinstance(result, list):
             return {"record_count": len(result)}
         if name == "get_graph_neighborhood":
@@ -1269,12 +1276,20 @@ class AgenticInvestigationAgent:
 
     @staticmethod
     def _evidence_refs(name: str, result: Any) -> list[str]:
+        if name == "get_event" and isinstance(result, dict) and result.get("event_id") is not None:
+            return [str(result["event_id"])]
         if isinstance(result, list):
-            return [
-                str(item["event_id"])
-                for item in result
-                if isinstance(item, dict) and item.get("event_id") is not None
-            ]
+            refs = set()
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("event_id") is not None:
+                    refs.add(str(item["event_id"]))
+                if item.get("from_event") is not None:
+                    refs.add(str(item["from_event"]))
+                if item.get("to_event") is not None:
+                    refs.add(str(item["to_event"]))
+            return sorted(refs)
         if name == "get_graph_neighborhood":
             return [item.removeprefix("event:") for item in result["member_event_nodes"]]
         if name == "get_detection_evidence":
