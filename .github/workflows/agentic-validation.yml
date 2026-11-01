@@ -1,0 +1,37 @@
+name: Agentic graph investigation checks
+
+on:
+  push:
+    branches:
+      - agentic-ai-investigation
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "attack_graph/**"
+      - "tests/**"
+      - ".github/workflows/agentic-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  graph-investigation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install graph investigation dependencies
+        run: python -m pip install pandas networkx
+
+      - name: Compile attack graph modules
+        run: python -m compileall -q attack_graph
+
+      - name: Run graph SOC assessment regression tests
+        run: python -m unittest discover -s tests -v
