@@ -1111,6 +1111,61 @@ def _compact_graph_analysis(overview: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_soc_assessment(assessment: dict[str, Any]) -> dict[str, Any]:
+    """Keep the graph-first assessment useful without duplicating full graph evidence."""
+    if not isinstance(assessment, dict):
+        return {}
+
+    def profile_subset(profile: Any, include_peers: bool = False) -> dict[str, Any]:
+        if not isinstance(profile, dict):
+            return {}
+        keys = [
+            "event_count",
+            "distinct_peer_host_count",
+            "attack_type_counts",
+            "time_start",
+            "time_end",
+        ]
+        if include_peers:
+            keys.append("distinct_peer_hosts")
+        return {key: profile.get(key) for key in keys if key in profile}
+
+    cluster = assessment.get("attack_type_cluster_profile", {})
+    exact_tuple = assessment.get("exact_source_destination_label_cluster", {})
+    compact_cluster = {
+        key: cluster.get(key)
+        for key in (
+            "event_count", "distinct_source_count", "distinct_sources",
+            "distinct_destination_count", "distinct_destinations",
+            "time_start", "time_end",
+        )
+        if key in cluster
+    } if isinstance(cluster, dict) else {}
+    compact_exact_tuple = {
+        key: exact_tuple.get(key)
+        for key in ("event_count", "time_start", "time_end", "event_ids")
+        if key in exact_tuple
+    } if isinstance(exact_tuple, dict) else {}
+    compact_exact_tuple["event_ids"] = compact_exact_tuple.get("event_ids", [])[:12]
+
+    return {
+        "selected_event_node": assessment.get("selected_event_node"),
+        "executive_assessment": assessment.get("executive_assessment"),
+        "graph_pattern_confidence": assessment.get("graph_pattern_confidence"),
+        "impact_status": assessment.get("impact_status"),
+        "key_findings": assessment.get("key_findings", [])[:7],
+        "selected_event_relations": assessment.get("selected_event_relations", {}),
+        "source_host_profile": profile_subset(assessment.get("source_host_profile", {}), True),
+        "destination_host_profile": profile_subset(assessment.get("destination_host_profile", {}), True),
+        "attack_type_cluster_profile": compact_cluster,
+        "exact_source_destination_label_cluster": compact_exact_tuple,
+        "direct_temporal_predecessors": assessment.get("direct_temporal_predecessors", []),
+        "direct_temporal_successors": assessment.get("direct_temporal_successors", []),
+        "hypotheses": assessment.get("hypotheses", [])[:2],
+        "recommended_investigations": assessment.get("recommended_investigations", [])[:4],
+    }
+
+
 def _make_prompt(
     target: dict[str, Any],
     evidence: dict[str, Any],
@@ -1181,7 +1236,9 @@ def _make_prompt(
             "detector_interpretation": _detector_context(target),
             "related_events_and_graph": compact_evidence,
             "multi_hop_graph_analysis": _compact_graph_analysis(evidence.get("graph_analysis", {})),
-            "soc_graph_assessment": evidence.get("graph_analysis", {}).get("soc_assessment", {}),
+            "soc_graph_assessment": _compact_soc_assessment(
+                evidence.get("graph_analysis", {}).get("soc_assessment", {})
+            ),
             "agent_tool_findings": [
                 {
                     "round": item.get("round"),
