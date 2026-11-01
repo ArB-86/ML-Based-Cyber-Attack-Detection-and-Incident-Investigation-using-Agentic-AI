@@ -499,6 +499,8 @@ class IncidentEvidenceTools:
             "detection_reasons": list(item["detection_reasons"]),
             "triage": dict(item["triage"]),
             "graph_analysis": dict(item["graph_analysis"]),
+            "attack_hypotheses": list(item.get("attack_hypotheses", [])),
+            "recommended_actions": list(item.get("recommended_actions", [])),
         }
 
     def get_event(self, event_id: str) -> dict[str, Any]:
@@ -673,9 +675,6 @@ class AgenticInvestigationAgent:
                 "confidence": "medium",
             })
 
-        for hypothesis in incident["graph_analysis"].get("attack_hypotheses", []):
-            pass
-
         result = {
             "agent": "AgenticInvestigationAgent",
             "mode": "tool_assisted",
@@ -690,7 +689,7 @@ class AgenticInvestigationAgent:
             "tool_calls": tool_calls,
             "findings": claims,
             "attack_hypotheses": incident.get("attack_hypotheses", []),
-            "recommended_actions": [],
+            "recommended_actions": list(incident.get("recommended_actions", [])),
             "narrative": (
                 f"{incident['title']}. The candidate contains {len(timeline)} correlated "
                 f"events over {incident['start_time']} to {incident['end_time']}. "
@@ -816,6 +815,17 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             lines.append("- No technique assigned: available network evidence is insufficient.")
         lines.extend(["", "**Recommended SOC actions:**"])
         lines.extend(f"- {action}" for action in item["recommended_actions"])
+        investigation = item.get("investigation_agent", {})
+        lines.extend([
+            "",
+            "**Tool-assisted agent investigation:**",
+            f"- Mode: {investigation.get('mode', 'not run')}",
+            f"- Tools executed: {len(investigation.get('tool_calls', []))}",
+            f"- Evidence-linked findings: {len(investigation.get('findings', []))}",
+        ])
+        for finding in investigation.get("findings", [])[:8]:
+            refs = ", ".join(finding.get("evidence_event_ids", []))
+            lines.append(f"- {finding['claim']} Evidence: {refs or 'not linked'}")
         lines.extend(["", f"**Evidence event IDs:** {', '.join(item['event_ids'])}", "", "---", ""])
 
     lines.extend([
@@ -847,7 +857,12 @@ def run_soc_investigation(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     events = build_soc_events(alert_flows)
-    return run_soc_investigation_from_events(events, out, reasoner=reasoner)
+    return run_soc_investigation_from_events(
+        events,
+        out,
+        reasoner=reasoner,
+        alert_flow_count=len(alert_flows),
+    )
 
 
 def run_soc_investigation_from_events(
@@ -855,6 +870,7 @@ def run_soc_investigation_from_events(
     output_dir: str | Path,
     *,
     reasoner=None,
+    alert_flow_count: int | None = None,
 ) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
     """Continue the canonical workflow from an already-formed event table."""
     out = Path(output_dir)
@@ -976,7 +992,7 @@ def run_soc_investigation_from_events(
             {"name": "reporting", "status": "completed", "output": "incident_investigation_report.md"},
         ],
         "counts": {
-            "alerts": int(len(alert_flows)) if "alert_flows" in locals() else None,
+            "alerts": alert_flow_count,
             "events": len(events),
             "correlations": len(correlations),
             "incidents": len(incidents),
