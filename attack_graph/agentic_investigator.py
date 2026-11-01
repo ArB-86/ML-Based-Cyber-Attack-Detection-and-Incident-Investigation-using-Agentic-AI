@@ -12,7 +12,7 @@ from typing import Any
 import networkx as nx
 import pandas as pd
 
-from .incident_investigator import load_events
+from .incident_investigator import build_incident_evidence, load_events
 
 
 ISOLATION_FOREST_THRESHOLD = 0.032849
@@ -1730,6 +1730,22 @@ def run(
 
     events = load_events(events_path)
     target = _event_record(events, event_id)
+
+    # Reuse the existing deterministic incident-triage implementation. The raw
+    # attack_events.csv does not contain triage_score; it is derived by the
+    # existing incident_investigator module from the same event records.
+    triage_evidence = build_incident_evidence(
+        events,
+        correlation_window_seconds=correlation_window_seconds,
+    )
+    triage_rows = triage_evidence.loc[
+        triage_evidence["event_id"].astype(str) == str(event_id)
+    ]
+    if not triage_rows.empty:
+        triage_record = triage_rows.iloc[0].to_dict()
+        target["triage_score"] = triage_record.get("triage_score")
+        target["triage_related_event_count"] = triage_record.get("related_event_count")
+
     evidence = retrieve_evidence(
         events,
         target,
