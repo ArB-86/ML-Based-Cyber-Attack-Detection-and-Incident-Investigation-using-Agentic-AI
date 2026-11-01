@@ -407,23 +407,29 @@ def test_model_detection_reason_is_added_exactly_once_for_all_alert_combinations
     model_reason = "ISOLATION_FOREST_ANOMALY"
     for index in range(10):
         tokens = result.loc[index, "detection_reasons"].split(";")
-        assert "PORT_SCAN" in tokens
         assert tokens.count(model_reason) == 1
-        assert result.loc[index, "rule_alert"]
+        assert result.loc[index, "review_reasons"] == "PORT_SCAN"
+        assert result.loc[index, "review_alert"]
+        assert not result.loc[index, "rule_alert"]
         assert result.loc[index, "model_alert"]
+        assert result.loc[index, "alert"]
 
     model_only_index = 10
     model_only_tokens = result.loc[model_only_index, "detection_reasons"].split(";")
     assert model_only_tokens == [model_reason]
     assert not result.loc[model_only_index, "rule_alert"]
     assert result.loc[model_only_index, "model_alert"]
+    assert result.loc[model_only_index, "alert"]
 
     for index in range(11, 21):
         tokens = result.loc[index, "detection_reasons"].split(";")
-        assert "PORT_SCAN" in tokens
-        assert model_reason not in tokens
-        assert result.loc[index, "rule_alert"]
+        assert tokens == [""]
+        assert result.loc[index, "review_reasons"] == "PORT_SCAN"
+        assert result.loc[index, "review_alert"]
+        assert not result.loc[index, "rule_alert"]
         assert not result.loc[index, "model_alert"]
+        assert not result.loc[index, "alert"]
+        assert result.loc[index, "review_candidate"]
 
 def test_low_precision_behaviours_are_context_only_and_not_alerts():
     rows = []
