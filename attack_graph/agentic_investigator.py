@@ -252,14 +252,46 @@ class AttackGraphInvestigationTools:
 
     def catalog(self) -> list[dict[str, Any]]:
         return [
-            {"name": "get_event_details", "purpose": "Retrieve exact source event records by event ID."},
-            {"name": "expand_graph_neighborhood", "purpose": "Traverse the existing graph around a node for multiple hops."},
-            {"name": "find_shared_host_events", "purpose": "Find other event nodes connected through the selected source/destination hosts."},
-            {"name": "trace_temporal_sequence", "purpose": "Trace only explicit graph edges labelled precedes."},
-            {"name": "summarize_connected_component", "purpose": "Identify all nodes and event records in the selected event's connected component."},
-            {"name": "summarize_attack_type_cluster", "purpose": "Find events connected to the selected attack-type node."},
-            {"name": "find_structural_paths", "purpose": "Find directed source-host to destination-host paths in the supplied graph."},
-            {"name": "summarize_graph_metrics", "purpose": "Calculate local graph size, node/edge types, degrees and bounded centrality."},
+            {
+                "name": "get_event_details",
+                "purpose": "Retrieve exact source event records by event ID.",
+                "arguments": {"event_ids": "list of event IDs; optional; defaults to selected event"},
+            },
+            {
+                "name": "expand_graph_neighborhood",
+                "purpose": "Traverse the existing graph around a node for multiple hops.",
+                "arguments": {"node_id": "event:EVT-00001, host:IP, attack:TYPE; optional", "hops": "integer 1-5"},
+            },
+            {
+                "name": "find_shared_host_events",
+                "purpose": "Find event nodes connected through the selected source/destination hosts.",
+                "arguments": {"event_id": "event ID; optional; defaults to selected event"},
+            },
+            {
+                "name": "trace_temporal_sequence",
+                "purpose": "Trace only explicit graph edges labelled precedes.",
+                "arguments": {"event_id": "event ID; optional", "max_events": "integer 1-100"},
+            },
+            {
+                "name": "summarize_connected_component",
+                "purpose": "Identify nodes and event records in the selected event's connected component.",
+                "arguments": {"event_id": "event ID; optional"},
+            },
+            {
+                "name": "summarize_attack_type_cluster",
+                "purpose": "Find events connected to the selected attack-type node.",
+                "arguments": {"attack_type": "dataset attack label; optional"},
+            },
+            {
+                "name": "find_structural_paths",
+                "purpose": "Find directed source-host to destination-host paths in the supplied graph.",
+                "arguments": {"source_host": "IP or host:IP; optional", "destination_host": "IP or host:IP; optional", "cutoff": "integer 1-8"},
+            },
+            {
+                "name": "summarize_graph_metrics",
+                "purpose": "Calculate local graph size, node/edge types, degrees and bounded centrality.",
+                "arguments": {"hops": "integer 1-5"},
+            },
         ]
 
     def _event_id(self, node: Any) -> str | None:
@@ -290,6 +322,8 @@ class AttackGraphInvestigationTools:
         return self.graph.subgraph(selected).copy()
 
     def get_event_details(self, event_ids: list[str] | None = None) -> dict[str, Any]:
+        if isinstance(event_ids, str):
+            event_ids = [event_ids]
         ids = [str(item) for item in (event_ids or [self.target_event_id])]
         return {
             "events": self._records(ids),
@@ -302,8 +336,10 @@ class AttackGraphInvestigationTools:
         hops: int = 3,
     ) -> dict[str, Any]:
         center = str(node_id or self.target_node)
-        if center == self.target_event_id:
+        if center.startswith("EVT-"):
             center = f"event:{center}"
+        elif "." in center and not center.startswith(("event:", "host:", "attack:")):
+            center = f"host:{center}"
         subgraph = self._bounded_subgraph(center, hops)
         nodes = [
             {
@@ -1555,6 +1591,19 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         component_events = graph_analysis.get("connected_component", {}).get("event_ids", [])
         if component_events:
             lines.append(f"- Connected event IDs: {', '.join(str(x) for x in component_events[:30])}.")
+        cluster = graph_analysis.get("attack_type_cluster", {})
+        if cluster.get("event_ids"):
+            lines.append(
+                f"- Events linked to attack-type node {cluster.get('attack_type')}: "
+                f"{', '.join(str(x) for x in cluster.get('event_ids', [])[:30])}."
+            )
+        neighborhood_edges = graph_analysis.get("neighborhood", {}).get("edges", [])
+        if neighborhood_edges:
+            lines.extend(["", "### Relation-labelled graph edges"])
+            for edge in neighborhood_edges[:35]:
+                lines.append(
+                    f"- {edge.get('source')} --{edge.get('relation')}--> {edge.get('target')}"
+                )
         temporal_sequence = graph_analysis.get("temporal_sequence", {}).get("sequence", [])
         if temporal_sequence:
             lines.extend(["", "### Explicit temporal sequence"])
