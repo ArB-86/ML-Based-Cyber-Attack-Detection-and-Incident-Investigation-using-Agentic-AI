@@ -575,6 +575,7 @@ def run(
     output_dir: str,
     benchmark_parquet: str | None = None,
     verify_only: bool = False,
+    reasoner=None,
 ) -> None:
     start = time.time()
 
@@ -696,7 +697,11 @@ def run(
 
     # Specialist graph analyst, threat-hunting and triage stages coordinate
     # event formation, topology analysis and evidence-backed reporting.
-    events, graph, investigation_summary = run_soc_investigation(suspicious, out)
+    events, graph, investigation_summary = run_soc_investigation(
+        suspicious,
+        out,
+        reasoner=reasoner,
+    )
 
     # The SOC orchestrator owns graph persistence after incident nodes and
     # membership edges have been added. The model runner only records status.
