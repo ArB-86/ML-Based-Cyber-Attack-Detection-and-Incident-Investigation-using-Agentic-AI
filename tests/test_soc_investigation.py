@@ -353,3 +353,69 @@ def test_explicit_correlation_table_is_the_incident_formation_input():
         correlations.iloc[0:0],
     ).form()
     assert len(disconnected) == 2
+
+
+def test_model_detection_reason_is_added_exactly_once_for_all_alert_combinations():
+    rows = []
+
+    # Ten destination ports for A -> B trigger PORT_SCAN and model alert.
+    for port in range(2000, 2010):
+        rows.append({
+            "timestamp": _time(0),
+            "src_ip": "A",
+            "dst_ip": "B",
+            "src_port": 40000 + port,
+            "dst_port": port,
+            "protocol": 6,
+            "anomaly_score": 0.01,
+        })
+
+    # Isolated model-only flow.
+    rows.append({
+        "timestamp": _time(0),
+        "src_ip": "C",
+        "dst_ip": "D",
+        "src_port": 41000,
+        "dst_port": 80,
+        "protocol": 6,
+        "anomaly_score": 0.01,
+    })
+
+    # Ten destination ports for E -> F trigger a rule without a model alert.
+    for port in range(3000, 3010):
+        rows.append({
+            "timestamp": _time(0),
+            "src_ip": "E",
+            "dst_ip": "F",
+            "src_port": 42000 + port,
+            "dst_port": port,
+            "protocol": 6,
+            "anomaly_score": 0.5,
+        })
+
+    result = merge_detector_outputs(
+        pd.DataFrame(rows),
+        anomaly_threshold=0.1,
+    )
+
+    model_reason = "ISOLATION_FOREST_ANOMALY"
+    for index in range(10):
+        tokens = result.loc[index, "detection_reasons"].split(";")
+        assert "PORT_SCAN" in tokens
+        assert tokens.count(model_reason) == 1
+        assert result.loc[index, "rule_alert"]
+        assert result.loc[index, "model_alert"]
+
+    model_only_index = 10
+    model_only_tokens = result.loc[model_only_index, "detection_reasons"].split(";")
+    assert model_only_tokens == [model_reason]
+    assert not result.loc[model_only_index, "rule_alert"]
+    assert result.loc[model_only_index, "model_alert"]
+
+    for index in range(11, 21):
+        tokens = result.loc[index, "detection_reasons"].split(";")
+        assert "PORT_SCAN" in tokens
+        assert model_reason not in tokens
+        assert result.loc[index, "rule_alert"]
+        assert not result.loc[index, "model_alert"]
+
