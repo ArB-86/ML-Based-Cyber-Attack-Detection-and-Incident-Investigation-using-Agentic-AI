@@ -21,10 +21,10 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from .event_builder import EventConfig, build_attack_events, normalize_columns
-from .graph_builder import add_sequence_edges, build_attack_graph, write_attack_graph_gexf
-from .incident_investigator import run_investigation
+from .event_builder import normalize_columns
+from .graph_builder import write_attack_graph_gexf
 from .soc_detection import merge_detector_outputs
+from .soc_investigation import run_soc_investigation
 
 
 LABEL_MAP = {
@@ -732,15 +732,9 @@ def run(
     suspicious_path = out / "suspicious_flows_with_metadata.csv"
     suspicious.to_csv(suspicious_path, index=False)
 
-    events = build_attack_events(
-        suspicious,
-        anomalous_only=True,
-        config=EventConfig(time_window_seconds=60),
-    )
-    events.to_csv(out / "attack_events.csv", index=False)
-
-    graph = build_attack_graph(events)
-    graph = add_sequence_edges(graph, events)
+    # The SOC workflow owns event formation, typed graph construction,
+    # temporal/pivot correlation, ATT&CK hypotheses, triage and reporting.
+    events, graph, investigation_summary = run_soc_investigation(suspicious, out)
 
     gexf_path = out / "attack_graph.gexf"
     gexf_written = False
@@ -816,8 +810,12 @@ def run(
         "benchmark_verification": exact_result if benchmark_parquet else None,
         "validation": val_metrics,
         "test": test_metrics,
-        "metadata_scoring_all_flagged_flows": int(df["predicted_anomaly"].sum()),
-        "metadata_scoring_non_benign_suspicious_flows": int(len(suspicious)),
+        "model_alert_flows": int(df["model_alert"].sum()),
+        "behavioural_rule_alert_flows": int(df["rule_alert"].sum()),
+        "combined_alert_flows": int(df["alert"].sum()),
+        "alert_flows_investigated": int(len(suspicious)),
+        "ground_truth_used_for_alert_selection": False,
+        "soc_investigation": investigation_summary,
         "attack_events": int(len(events)),
         "graph_nodes": int(graph.number_of_nodes()),
         "graph_edges": int(graph.number_of_edges()),
@@ -831,8 +829,11 @@ def run(
     )
 
     print("\nDONE")
-    print(f"All flagged flows:        {df['predicted_anomaly'].sum():,}")
-    print(f"Non-BENIGN suspicious:    {len(suspicious):,}")
+    print(f"Isolation Forest alerts:  {df['model_alert'].sum():,}")
+    print(f"Behavioural rule alerts:  {df['rule_alert'].sum():,}")
+    print(f"Combined SOC alerts:      {df['alert'].sum():,}")
+    print(f"Alert flows investigated: {len(suspicious):,}")
+    print(f"Candidate incidents:      {investigation_summary['incident_count']:,}")
     print(f"Attack events:            {len(events):,}")
     print(f"Graph nodes:              {graph.number_of_nodes():,}")
     print(f"Graph edges:              {graph.number_of_edges():,}")
