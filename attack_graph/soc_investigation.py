@@ -592,8 +592,8 @@ class ThreatHuntingAgent:
                 "technique": "Brute Force",
                 "confidence": "medium",
                 "evidence": (
-                    "Event records matched the high-specificity repeated-flow "
-                    "authentication-service heuristic."
+                    "Event records matched the configured repeated-flow threshold on an "
+                    "authentication-related service port; this is a flow-pattern candidate."
                 ),
                 "evidence_event_ids": brute_ids,
                 "caveat": (
