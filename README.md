@@ -1,18 +1,68 @@
 # ML-Based Cyber-Attack Detection and SOC Incident Investigation
 
-This repository contains a CICIDS2017 Isolation Forest benchmark and an evidence-first SOC investigation pipeline. The operational workflow is designed to reconstruct related network activity from flow metadata instead of producing only a generic model summary.
+This repository implements one connected incident lifecycle for CICIDS2017 flow telemetry. Use `attack_graph.pipeline` as the canonical entry point. The old prototype detector and old incident-investigator commands are compatibility adapters; they no longer run separate detection or triage algorithms.
 
-## SOC workflow
+## Canonical end-to-end flow
 
-1. Detection: Isolation Forest provides an unsupervised anomaly signal. Independent metadata-based behavioural rules can also raise alerts.
-2. Event formation: detector alerts are grouped by source, destination, protocol and temporal proximity. The operational event builder does not use the CICIDS ground-truth Label column. Distinct source/destination IPs, ports and timestamps are retained during metadata-path deduplication, even when numeric flow features match.
-3. Attack graph: typed host, event, service and detection nodes are connected through shared-source, shared-destination, shared-service and target-to-source host-pivot relationships.
-4. SOC investigation: specialist stages analyse graph topology, create cautious MITRE ATT&CK hypotheses, score incident priority and produce evidence-backed response recommendations.
-5. Reporting: CSV and JSON retain the evidence. The Markdown report includes a prioritised incident queue, source/target concentration, graph links, event timelines, ATT&CK hypotheses, caveats and analyst actions.
+```text
+CICIDS2017 CSVs
+  -> Schema validation and metadata-preserving preprocessing
+  -> Train-only imputation and Isolation Forest fitting
+  -> Validation-calibrated anomaly scores
+  -> Independent behavioural detections
+  -> Unified alert records (model/rule provenance + evidence)
+  -> Temporal and entity correlation
+  -> Candidate incident formation
+  -> Incident-linked attack graph
+  -> Incident-level risk and confidence
+  -> Read-only investigation tools
+  -> Evidence-linked findings and recommended SOC actions
+  -> JSON / CSV / GEXF / Markdown report
+```
 
-## Independent behavioural detections
+Each stage consumes the previous stage's output contract. `incident_id` links the incident dossier to its event IDs, the graph's incident node, risk assessment, agent tool calls and final report. `event_correlations.csv` preserves the relationship type, time gap, shared entity and host-pivot evidence. `soc_pipeline_manifest.json` records stage completion, counts and generated artefacts.
 
-The following rules complement Isolation Forest. They use timestamps, IP addresses, ports, protocol and flow metadata. They never inspect the Label column.
+## Run the canonical pipeline
+
+Create the environment:
+
+    python -m venv .venv-benchmark
+    .\.venv-benchmark\Scripts\Activate.ps1
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements-benchmark.txt
+
+Run on the eight metadata-rich CICIDS2017 CSV files:
+
+    python -m attack_graph.pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --output-dir "soc_output"
+
+To additionally verify the historical notebook benchmark before running the SOC pipeline:
+
+    python -m attack_graph.pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "soc_output"
+
+To run only the historical benchmark verifier:
+
+    python -m attack_graph.pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "soc_output" --verify-only
+
+`if_attack_graph_pipeline.py` is a backward-compatible alias to the canonical pipeline. Its old independent prototype flow has been retired. `incident_investigator.py` is also a compatibility adapter; it imports legacy event CSVs into the shared event contract and invokes the same graph, risk and investigation workflow.
+
+## Pipeline component contracts
+
+| Stage | Input | Output / responsibility |
+|---|---|---|
+| Ingestion and preprocessing | CICIDS2017 CSVs | Canonical columns; preserve timestamp/IP/port/protocol metadata; fit imputation only on training rows |
+| ML detection | 69-feature flow matrix | Isolation Forest anomaly score and model alert provenance |
+| Behaviour detection | Timestamp, endpoints, ports, protocol and flow metadata | Explainable scan, fan-out, DDoS-pattern and authentication-service rule signals |
+| Alert fusion | Model and behavioural outputs | One alert decision per flow; `alert_sources` and `detection_reasons` |
+| Event correlation | Alert flows | Events grouped by endpoint pair/protocol/time; graph relations record shared source, target, service and host pivots |
+| Incident formation | Correlated event graph | Connected candidate incident groups with stable incident IDs in the run |
+| Attack graph | Events and correlation relations | Typed host, event, service, detection and incident nodes; incident-to-event membership edges |
+| Risk assessment | Incident event set and graph metrics | Transparent priority score, severity and confidence; score is not a compromise probability |
+| Investigation agent | Incident dossier plus read-only tools | Incident, event timeline, graph neighbourhood and detection-provenance retrieval; tool trace and evidence-linked findings |
+| Reporting | Full structured incident context | Incident CSV/JSON, correlation CSV, GEXF, Markdown and stage manifest |
+
+### Behavioural detections
+
+These independent rules complement Isolation Forest and never read the CICIDS ground-truth `Label` during alert selection.
 
 | Rule | Default condition within a 5-minute bucket |
 |---|---|
@@ -22,67 +72,57 @@ The following rules complement Isolation Forest. They use timestamps, IP address
 | Distributed DoS pattern | One destination receives at least 40 flows from at least 15 distinct sources |
 | Brute-force pattern | At least 12 flows from one source to one destination on a common authentication port |
 
-These are transparent hunt heuristics, not calibrated classifiers. Fixed time buckets can miss activity crossing a bucket boundary. A streaming deployment should use stateful rolling windows and tune thresholds against the target network.
+These are hunt heuristics, not calibrated classifiers. Fixed time buckets can miss behaviour crossing a boundary; streaming deployment needs stateful rolling windows and network-specific threshold calibration.
 
-## Run the SOC pipeline
+### Correlation and incident formation
 
-Create and activate the environment:
+Events are linked independently by shared source, shared destination, shared destination service and target-to-source host pivots. Connected event components form candidate incidents. The graph includes a first-class `incident` node with risk/severity attributes and `contains` edges to its event nodes. Correlation output is inspectable in `event_correlations.csv` rather than being hidden inside an aggregate report.
 
-    python -m venv .venv-benchmark
-    .\.venv-benchmark\Scripts\Activate.ps1
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements-benchmark.txt
+### Risk assessment
 
-Run on the eight metadata-rich CICIDS2017 CSV files:
+The priority score combines detection-rule diversity, event persistence, source fan-out, destination convergence, service diversity and relative anomaly rank only when Isolation Forest actually fired for that incident. Severity is derived from the heuristic score. Confidence reflects independent evidence types and event support. Neither is a calibrated probability of compromise.
 
-    python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --output-dir "soc_output"
+### Tool-driven investigation
 
-For the SOC run, imputation medians are fitted on training rows only. The Isolation Forest threshold is calibrated from the 5th percentile of held-out benign validation scores. The test partition is reserved for final evaluation; its labels do not select alerts or tune the threshold.
+`AgenticInvestigationAgent` executes a predefined read-only tool plan: `get_incident`, `get_timeline`, `get_graph_neighborhood` and `get_detection_evidence`. Each tool call records its arguments, a result summary and event evidence references. Findings include the event IDs and graph edges supporting each claim.
 
-## Historical benchmark reproduction
-
-The exact benchmark verifier is intentionally retained to check the original notebook reference numbers. Run it separately:
-
-    python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "soc_output" --verify-only
-
-This historical verification path mirrors the original notebook, including its full-dataset median-imputation behavior. It is kept for reproducibility and must not be confused with the leakage-safe SOC training/evaluation path.
-
-If you provide --benchmark-parquet without --verify-only, the benchmark is checked first and the operational SOC pipeline still trains and calibrates on the metadata pipeline's own split.
-
-## Graph reasoning and incident triage
-
-The graph adds independent links for repeated activity from a shared source, multiple sources converging on the same destination, events touching the same destination service, and a host that is first targeted and later initiates another related connection (a host-pivot lead). Connected event components become candidate incidents.
-
-The triage score combines behavioural-rule diversity, persistence, source fan-out, destination convergence, service diversity and (when Isolation Forest actually raised an alert) relative anomaly rank. It is a heuristic priority score, not a probability of compromise.
-
-ATT&CK mappings are hypotheses with evidence and caveats. Network probing may support a T1046 candidate, repeated authentication-service flows may support T1110, and converging traffic may support T1498. Flow records alone cannot confirm credential guessing, successful compromise, lateral movement or service impact.
+The default mode is a deterministic, tool-assisted baseline. A project-specific LLM reasoner can be injected into `run_soc_investigation(..., reasoner=...)` using the evidence bundle; this keeps model-server configuration separate from incident orchestration. This GitHub repository does not currently contain an Ollama client/runtime integration, and these changes do not modify Ollama.
 
 ## Output artefacts
 
 | File | Contents |
 |---|---|
-| cicids_if_predictions_with_metadata.csv | Flow-level model scores, behavioural-rule flags and combined alert decision |
-| suspicious_flows_with_metadata.csv | All model OR behavioural-rule alerts, including benign-labelled false positives |
-| attack_events.csv | Detector-derived, metadata-preserving events |
-| attack_graph.gexf | Typed graph for Gephi or another GEXF-compatible viewer |
-| incident_investigation.csv | Event-to-incident assignments, triage and confidence |
-| incident_investigation.json | Structured incident dossiers, graph metrics, timelines, ATT&CK hypotheses and response actions |
-| incident_investigation_report.md | SOC analyst-oriented investigation report |
-| pipeline_summary.json | Dataset, threshold, detector, graph and incident counts |
+| `cicids_if_predictions_with_metadata.csv` | Flow-level model scores, rule flags and unified alert decision |
+| `suspicious_flows_with_metadata.csv` | All model OR behavioural-rule alerts, including benign-labelled false positives |
+| `attack_events.csv` | Detector-derived event records |
+| `event_correlations.csv` | Event-to-event relationship evidence, time gaps and pivot hosts |
+| `attack_graph.gexf` | Incident-linked graph for Gephi or compatible viewers |
+| `incident_investigation.csv` | Event-to-incident assignments and incident-level triage |
+| `incident_investigation.json` | Structured incident dossiers, graph findings, tool calls and evidence-linked findings |
+| `incident_investigation_report.md` | SOC analyst investigation report |
+| `soc_pipeline_manifest.json` | Stage sequence, status, counts and output artefacts |
+| `pipeline_summary.json` | Model, detector, graph and incident metrics |
 
-The alert-selection and investigation path does not use ground-truth labels. Labels remain available for offline evaluation only. The report documents limitations of benchmark flow data and requires analyst validation before containment.
+## Data and research limitations
 
-## Ollama / local LLM
+CICIDS2017 provides labelled network flows, timestamps, endpoints, ports, protocols and flow-level traffic statistics. It does not by itself provide authentication success/failure logs, operating-system process execution, privilege changes or file-access telemetry. Therefore this flow-only system can identify network-level patterns and candidate ATT&CK hypotheses, but it cannot prove a chain such as failed login -> successful login -> privilege escalation -> sensitive file access -> exfiltration without additional identity, endpoint and application data sources.
 
-No Ollama integration is present in the tracked source files of this GitHub repository, so this change does not add, configure or alter Ollama, its model, server, prompts or latency. The structured incident JSON is ready to be consumed by a separate local-LLM layer if you have one in your local workspace. The LLM should explain those findings; it should not invent entities, attack chains, severity or ATT&CK mappings absent from the evidence JSON.
+Ground-truth labels remain available for offline benchmark evaluation, not operational alert selection, event correlation, incident grouping, graph construction, risk scoring or agent findings. The historical exact benchmark verifier intentionally retains notebook preprocessing for reproduction and must not be confused with the leakage-safe metadata SOC pipeline.
 
-Important scope distinction: the graph analyst, threat-hunting and triage stages in this branch are deterministic, role-separated analysis modules. They form an auditable investigation workflow, not a claim that autonomous tool-using LLM agents are already implemented.
+## Research evaluation
+
+Compare incremental configurations on the same held-out data and report detection metrics, incident reconstruction metrics and analyst-investigation quality separately:
+
+1. Detection only.
+2. Detection + event correlation.
+3. Detection + correlation + attack graph + incident risk.
+4. Full system + tool-driven investigation.
+
+Useful incident metrics include event-to-incident assignment precision/recall, pairwise event-link precision/recall, incident detection delay, duplicate-incident rate and evidence coverage. LLM output quality should be evaluated for factual support, citation coverage, unsupported claims and analyst usefulness rather than judged only by report length.
 
 ## Tests
-
-Install pytest and run:
 
     python -m pip install pytest
     pytest -q
 
-Focused tests cover label-independent detections, investigation of benign-labelled alerts, shared-target graph edges and host-pivot reconstruction.
+GitHub Actions runs Python compilation and the focused integration tests on each push and pull request.
