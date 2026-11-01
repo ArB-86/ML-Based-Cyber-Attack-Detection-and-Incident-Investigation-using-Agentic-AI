@@ -36,8 +36,12 @@ def test_behavioural_rules_are_independent_of_ground_truth_label():
     second = detect_behavioral_alerts(attack, thresholds)
     assert first["rule_alert"].tolist() == second["rule_alert"].tolist()
     assert first["detection_reasons"].tolist() == second["detection_reasons"].tolist()
-    assert first["rule_alert"].all()
-    assert first["detection_reasons"].str.contains("PORT_SCAN").all()
+    # Port-scan patterns are retained for analyst review, not promoted
+    # directly into the primary alert stream.
+    assert not first["rule_alert"].any()
+    assert first["review_alert"].all()
+    assert first["review_reasons"].str.contains("PORT_SCAN").all()
+    assert first["matched_rule_reasons"].str.contains("PORT_SCAN").all()
 
 
 def test_rule_alerts_reach_soc_investigation_even_when_label_says_benign(tmp_path):
@@ -47,7 +51,7 @@ def test_rule_alerts_reach_soc_investigation_even_when_label_says_benign(tmp_pat
             "src_ip": "10.0.0.1",
             "dst_ip": "10.0.0.9",
             "src_port": 40000 + port,
-            "dst_port": port,
+            "dst_port": 22,
             "protocol": 6,
             "anomaly_score": 0.5,
             "label": "BENIGN",
@@ -56,16 +60,18 @@ def test_rule_alerts_reach_soc_investigation_even_when_label_says_benign(tmp_pat
     ])
     scored = merge_detector_outputs(rows, anomaly_threshold=0.1)
     assert scored["rule_alert"].all()
+    assert not scored["review_alert"].any()
     assert not scored["model_alert"].any()
     assert scored["alert"].all()
+    assert scored["detection_reasons"].str.contains("BRUTE_FORCE_PATTERN").all()
 
     events, graph, summary = run_soc_investigation(scored, tmp_path)
     assert len(events) == 1
     assert int(events.iloc[0]["flow_count"]) == 12
-    assert "PORT_SCAN" in events.iloc[0]["detection_reasons"]
+    assert "BRUTE_FORCE_PATTERN" in events.iloc[0]["detection_reasons"]
     assert summary["incident_count"] == 1
     report = (tmp_path / "incident_investigation_report.md").read_text()
-    assert "Network Service Discovery" in report
+    assert "Brute Force" in report
     payload = json.loads((tmp_path / "incident_investigation.json").read_text())
     assert payload["ground_truth_labels_used"] is False
 
@@ -418,4 +424,75 @@ def test_model_detection_reason_is_added_exactly_once_for_all_alert_combinations
         assert model_reason not in tokens
         assert result.loc[index, "rule_alert"]
         assert not result.loc[index, "model_alert"]
+
+def test_low_precision_behaviours_are_context_only_and_not_alerts():
+    rows = []
+
+    # One source reaches several destinations on the same service.
+    for number in range(4):
+        rows.append({
+            "timestamp": _time(0),
+            "src_ip": "10.0.0.1",
+            "dst_ip": f"10.0.1.{number + 1}",
+            "src_port": 40000 + number,
+            "dst_port": 80,
+            "protocol": 6,
+        })
+
+    # Many sources send multiple flows to one destination.
+    for source in range(3):
+        for attempt in range(2):
+            rows.append({
+                "timestamp": _time(0, second=10 + attempt),
+                "src_ip": f"10.0.2.{source + 1}",
+                "dst_ip": "10.0.3.1",
+                "src_port": 41000 + source * 10 + attempt,
+                "dst_port": 443,
+                "protocol": 6,
+            })
+
+    thresholds = BehaviourThresholds(
+        source_fanout_unique_targets=3,
+        horizontal_scan_unique_targets=3,
+        ddos_unique_sources=3,
+        ddos_min_flows=4,
+    )
+    result = detect_behavioral_alerts(pd.DataFrame(rows), thresholds)
+
+    assert not result["rule_alert"].any()
+    assert not result["review_alert"].any()
+    assert result["detection_reasons"].eq("").all()
+    assert result["context_signals"].str.contains(
+        "HIGH_SOURCE_FANOUT"
+    ).any()
+    assert result["context_signals"].str.contains(
+        "HORIZONTAL_SCAN"
+    ).any()
+    assert result["context_signals"].str.contains(
+        "DISTRIBUTED_DOS_PATTERN"
+    ).any()
+    assert result["matched_rule_reasons"].ne("").any()
+
+
+def test_port_scan_is_secondary_review_candidate_not_primary_alert():
+    rows = pd.DataFrame([
+        {
+            "timestamp": _time(0),
+            "src_ip": "10.0.0.1",
+            "dst_ip": "10.0.0.9",
+            "src_port": 40000 + port,
+            "dst_port": port,
+            "protocol": 6,
+            "anomaly_score": 0.5,
+        }
+        for port in range(2000, 2012)
+    ])
+
+    result = merge_detector_outputs(rows, anomaly_threshold=0.1)
+    assert result["review_alert"].all()
+    assert result["review_candidate"].all()
+    assert not result["rule_alert"].any()
+    assert not result["model_alert"].any()
+    assert not result["alert"].any()
+    assert result["review_reasons"].str.contains("PORT_SCAN").all()
 
