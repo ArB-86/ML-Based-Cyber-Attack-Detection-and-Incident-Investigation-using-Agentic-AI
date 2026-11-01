@@ -1746,7 +1746,7 @@ def _guard_unsupported_auth_outcome_claims(
         )
         for item in observed:
             item_text = str(item)
-            if re.search(r"(?i)\\b(?:botnet|bot attack|bot activity|classified as a bot)\\b", item_text):
+            if re.search(r"(?i)\b(?:botnet|bot attack|bot activity|classified as a bot)\b", item_text):
                 continue
             safe_observed.append(item_text)
         if isinstance(graph_assessment, dict):
@@ -1980,22 +1980,40 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         lines.append("- Component event-ID list is truncated.")
 
     lines.extend(["", "## 4. Investigation hypotheses", ""])
-    hypotheses = result.get("hypotheses", []) or assessment.get("hypotheses", [])
-    if hypotheses:
-        for hypothesis in hypotheses:
+    graph_hypotheses = assessment.get("hypotheses", [])
+    model_hypotheses = result.get("hypotheses", [])
+    if graph_hypotheses:
+        lines.append("### Graph-supported working hypothesis")
+        for hypothesis in graph_hypotheses:
             lines.append(
                 f"- **{hypothesis.get('claim', '')}** "
                 f"(confidence: {hypothesis.get('confidence', 'unknown')})"
             )
             for evidence_item in hypothesis.get("supporting_evidence", []):
-                lines.append(f"  - Evidence: {evidence_item}")
-    else:
+                lines.append(f"  - Graph evidence: {evidence_item}")
+    additional_hypotheses = [
+        item for item in model_hypotheses if item not in graph_hypotheses
+    ]
+    if additional_hypotheses:
+        lines.extend(["", "### Agentic analyst hypotheses"])
+        for hypothesis in additional_hypotheses[:3]:
+            lines.append(
+                f"- **{hypothesis.get('claim', '')}** "
+                f"(confidence: {hypothesis.get('confidence', 'unknown')})"
+            )
+            for evidence_item in hypothesis.get("supporting_evidence", []):
+                lines.append(f"  - Supporting evidence: {evidence_item}")
+    if not graph_hypotheses and not additional_hypotheses:
         lines.append("- No testable hypothesis was returned.")
 
     lines.extend(["", "## 5. Analyst synthesis", ""])
     if result.get("summary") and result.get("summary") != assessment.get("executive_assessment"):
         lines.append(str(result.get("summary")))
-    observed = result.get("observed_evidence", [])
+    graph_findings = set(assessment.get("key_findings", []))
+    observed = [
+        item for item in result.get("observed_evidence", [])
+        if str(item) not in graph_findings
+    ]
     if observed:
         lines.extend(["", "### Additional observed evidence"])
         lines.extend(f"- {item}" for item in observed[:10])
@@ -2004,9 +2022,20 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         lines.append(str(result.get("risk_rationale")))
 
     lines.extend(["", "## 6. Recommended analyst actions", ""])
-    recommendations = result.get("recommended_next_steps") or assessment.get("recommended_investigations", [])
+    recommendations = assessment.get("recommended_investigations", [])
+    model_recommendations = result.get("recommended_next_steps", [])
     if recommendations:
         lines.extend(f"{index}. {item}" for index, item in enumerate(recommendations, 1))
+        existing_recommendations = {str(item) for item in recommendations}
+        extra_recommendations = [
+            item for item in model_recommendations
+            if str(item) not in existing_recommendations
+        ]
+        if extra_recommendations:
+            lines.extend(["", "### Additional agent-suggested checks"])
+            lines.extend(f"- {item}" for item in extra_recommendations[:3])
+    elif model_recommendations:
+        lines.extend(f"{index}. {item}" for index, item in enumerate(model_recommendations, 1))
     else:
         lines.append("- No recommendations were returned.")
 
@@ -2167,6 +2196,11 @@ def run(
         investigation["event_id"] = str(event_id)
         investigation = _guard_unsupported_auth_outcome_claims(
             investigation, target, graph_analysis.get("soc_assessment", {})
+        )
+        graph_assessment = graph_analysis.get("soc_assessment", {})
+        investigation["risk_rationale"] = (
+            f"Graph-pattern confidence: {graph_assessment.get('graph_pattern_confidence', 'not established')} "
+            f"Operational impact: {graph_assessment.get('impact_status', 'unknown')}"
         )
         mode = f"{provider}_agentic_graph_investigation"
         used_model = agent_run.get("model")
