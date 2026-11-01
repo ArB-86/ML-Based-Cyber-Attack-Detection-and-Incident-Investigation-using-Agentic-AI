@@ -992,7 +992,7 @@ def _ask_llm(
     if provider == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
         model_name = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-        client = OpenAI(base_url=base_url, api_key="ollama")
+        client = OpenAI(base_url=base_url, api_key="ollama", timeout=180.0, max_retries=0)
     elif provider == "openai":
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError(
@@ -1001,7 +1001,7 @@ def _ask_llm(
                 "--provider openai explicitly."
             )
         model_name = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=120.0, max_retries=0)
     else:
         raise ValueError(
             f"Unsupported provider {provider!r}; choose 'ollama' or 'openai'."
