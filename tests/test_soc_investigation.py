@@ -212,6 +212,10 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
                         "name": "get_event",
                         "arguments": {"event_id": "EVT-999999"},
                     },
+                    {
+                        "name": "get_host_activity",
+                        "arguments": {"host_ip": "B", "incident_id": "INC-OTHER"},
+                    },
                 ],
                 "preliminary_findings": [],
                 "narrative": "Need to inspect pivot host B.",
@@ -253,7 +257,36 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
         for call in agent["tool_calls"]
     )
     assert any(
+        call["tool"] == "get_host_activity"
+        and call["status"] == "rejected"
+        and "Cross-incident" in call["error"]
+        for call in agent["tool_calls"]
+    )
+    assert any(
         finding["source"] == "llm_evidence_validated"
         for finding in agent["findings"]
     )
     assert summary["agent_tool_calls"] >= 6
+
+
+def test_reasoner_failure_falls_back_to_deterministic_investigation(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 22, "alert": True,
+            "detection_reasons": "BRUTE_FORCE_PATTERN", "alert_sources": "BEHAVIOURAL_RULE",
+            "anomaly_score": 0.01,
+        },
+    ])
+
+    def unavailable_reasoner(_context):
+        raise TimeoutError("local reasoner unavailable")
+
+    run_soc_investigation(flows, tmp_path, reasoner=unavailable_reasoner)
+    payload = json.loads((tmp_path / "incident_investigation.json").read_text())
+    agent = payload["incidents"][0]["investigation_agent"]
+    assert agent["status"] == "completed"
+    assert agent["mode"] == "tool_assisted_llm_fallback"
+    assert "TimeoutError" in agent["reasoner_error"]
+    assert agent["findings"]
+    assert len(agent["tool_calls"]) >= 5
