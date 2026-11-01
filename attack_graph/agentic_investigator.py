@@ -1552,6 +1552,7 @@ def _ask_llm(
 def _guard_unsupported_auth_outcome_claims(
     investigation: dict[str, Any],
     target: dict[str, Any],
+    graph_assessment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Neutralize unsupported success/failure assertions where no auth result exists."""
     score = target.get("mean_anomaly_score")
@@ -1726,21 +1727,14 @@ def _guard_unsupported_auth_outcome_claims(
 
         investigation = soften_botnet_claims(investigation)
 
-        # Use grounded language for the primary report fields so model phrasing
-        # cannot reintroduce an unsupported botnet/coordinated-attack conclusion.
-        event_id = str(target.get("event_id", "unknown"))
-        score_text = (
-            f"{float(score):.6f}"
-            if score is not None and not pd.isna(score)
-            else "unavailable"
+        # Keep Bot-labelled reports graph-first after neutralizing unsupported
+        # botnet claims. The detector score remains secondary context.
+        summary_from_graph = (
+            graph_assessment.get("executive_assessment")
+            if isinstance(graph_assessment, dict) else None
         )
-        investigation["summary"] = (
-            f"Event {event_id} is labeled Bot in the CICIDS dataset and was "
-            f"{'flagged suspicious' if score is not None and not pd.isna(score) and float(score) < ISOLATION_FOREST_THRESHOLD else 'reviewed'} "
-            f"by the Isolation Forest (mean decision score: {score_text}; "
-            f"threshold: {ISOLATION_FOREST_THRESHOLD:.6f}). The dataset label "
-            "and anomaly flag do not independently establish coordinated botnet activity or impact."
-        )
+        if summary_from_graph:
+            investigation["summary"] = summary_from_graph
 
         observed = investigation.get("observed_evidence", [])
         if not isinstance(observed, list):
@@ -1752,36 +1746,27 @@ def _guard_unsupported_auth_outcome_claims(
         )
         for item in observed:
             item_text = str(item)
-            if re.search(r"(?i)\b(?:botnet|bot attack|bot activity|classified as a bot)\b", item_text):
+            if re.search(r"(?i)\\b(?:botnet|bot attack|bot activity|classified as a bot)\\b", item_text):
                 continue
             safe_observed.append(item_text)
-        safe_observed.insert(0, label_statement)
-        investigation["observed_evidence"] = safe_observed
+        if isinstance(graph_assessment, dict):
+            graph_findings = graph_assessment.get("key_findings", [])
+            safe_observed.extend(str(item) for item in graph_findings if str(item) not in safe_observed)
+        investigation["observed_evidence"] = [label_statement] + safe_observed
 
-        investigation["risk_rationale"] = (
-            f"The mean Isolation Forest decision score is {score_text}; the configured "
-            f"threshold is {ISOLATION_FOREST_THRESHOLD:.6f}. "
-            + (
-                "The score is below threshold, so the pipeline flags this event as suspicious. "
-                if score is not None and not pd.isna(score) and float(score) < ISOLATION_FOREST_THRESHOLD
-                else "The available score does not meet the configured suspicious threshold. "
-                if score is not None and not pd.isna(score)
-                else "No usable Isolation Forest score was supplied. "
+        if isinstance(graph_assessment, dict) and graph_assessment:
+            investigation["risk_rationale"] = (
+                f"Graph-pattern confidence: {graph_assessment.get('graph_pattern_confidence', 'not established')} "
+                f"Operational impact: {graph_assessment.get('impact_status', 'unknown')}"
             )
-            + "This anomaly flag and the CICIDS Bot label do not establish coordinated botnet activity or operational impact."
-        )
+            graph_recommendations = graph_assessment.get("recommended_investigations", [])
+            if graph_recommendations:
+                investigation["recommended_next_steps"] = graph_recommendations
+        else:
+            investigation["risk_rationale"] = (
+                "The CICIDS Bot label and anomaly flag do not establish coordinated botnet activity or operational impact."
+            )
 
-        recommendations = investigation.get("recommended_next_steps", [])
-        if not isinstance(recommendations, list):
-            recommendations = [recommendations] if recommendations else []
-        investigation["recommended_next_steps"] = [
-            (
-                "Validate the related flow records, source/destination context, and relevant logs before deciding whether segmentation or containment is warranted."
-                if re.search(r"(?i)\b(?:botnet|coordinated (?:bot|attack|activity)|limit the spread)\b", str(item))
-                else str(item)
-            )
-            for item in recommendations
-        ]
 
     return investigation
 
@@ -2180,7 +2165,9 @@ def run(
             provider=provider,
         )
         investigation["event_id"] = str(event_id)
-        investigation = _guard_unsupported_auth_outcome_claims(investigation, target)
+        investigation = _guard_unsupported_auth_outcome_claims(
+            investigation, target, graph_analysis.get("soc_assessment", {})
+        )
         mode = f"{provider}_agentic_graph_investigation"
         used_model = agent_run.get("model")
 
