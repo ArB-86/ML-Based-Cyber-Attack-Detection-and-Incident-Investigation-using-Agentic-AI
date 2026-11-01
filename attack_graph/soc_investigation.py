@@ -348,7 +348,15 @@ class SOCInvestigationOrchestrator:
             ids = sorted(rows["event_id"].astype(str).tolist())
             graph_data = self.graph_agent.analyse(component, rows)
             hypotheses = ThreatHuntingAgent.analyse(rows, graph_data)
-            values = [self.anomaly_strength[eid] for eid in ids if eid in self.anomaly_strength]
+            # A stored IF score is not an independent signal unless IF
+            # actually fired an alert for this incident.
+            model_was_triggered = "ISOLATION_FOREST" in _tokens(
+                rows.get("alert_sources", pd.Series(dtype=object))
+            )
+            values = (
+                [self.anomaly_strength[eid] for eid in ids if eid in self.anomaly_strength]
+                if model_was_triggered else []
+            )
             anomaly_strength = None if not values else float(sum(values) / len(values))
             triage = IncidentTriageAgent.score(rows, graph_data, hypotheses, anomaly_strength)
             reasons = sorted(_tokens(rows.get("detection_reasons", pd.Series(dtype=object))))
