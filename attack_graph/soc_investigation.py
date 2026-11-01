@@ -1679,7 +1679,12 @@ def run_soc_investigation_from_events(
         "ground_truth_labels_used": False,
         "risk_score_is_probability": False,
         "stage_sequence": [
-            "alert_ingestion",
+            "data_ingestion",
+            "metadata_preprocessing",
+            "ml_detection",
+            "behavioural_detection",
+            "alert_fusion",
+            "event_aggregation",
             "event_correlation",
             "incident_formation",
             "attack_graph_construction",
