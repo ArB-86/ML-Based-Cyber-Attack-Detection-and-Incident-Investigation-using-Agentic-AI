@@ -1122,26 +1122,45 @@ class AgenticInvestigationAgent:
         model_findings: list[dict[str, Any]] = []
         model_response: dict[str, Any] = {}
 
+        reasoner_error = None
         if self.reasoner is not None:
-            first_response = self._decode_reasoner_response(self.reasoner({
-                "task": (
-                    "Act as a SOC analyst. Inspect the supplied evidence, identify what is "
-                    "still unknown, and request only relevant read-only tools. Do not assert "
-                    "compromise from flow metadata alone. Return JSON with tool_calls (max 5), "
-                    "preliminary_findings and narrative."
-                ),
-                "incident": incident,
-                "timeline": timeline,
-                "graph": graph,
-                "detections": detections,
-                "deterministic_findings": claims,
-                "tool_catalog": self.TOOL_CATALOG,
-                "response_contract": {
-                    "tool_calls": [{"name": "get_event|get_host_activity|get_service_activity|get_correlated_events", "arguments": {}}],
-                    "preliminary_findings": [{"claim": "string", "evidence_event_ids": ["event id"], "confidence": "low|medium|high"}],
-                    "narrative": "string",
-                },
-            }))
+            first_response: dict[str, Any] = {}
+            try:
+                first_response = self._decode_reasoner_response(self.reasoner({
+                    "task": (
+                        "Act as a SOC analyst. Inspect the supplied evidence, identify what is "
+                        "still unknown, and request only relevant read-only tools. Do not assert "
+                        "compromise from flow metadata alone. Return JSON with tool_calls (max 5), "
+                        "preliminary_findings and narrative."
+                    ),
+                    "incident": incident,
+                    "timeline": timeline,
+                    "graph": graph,
+                    "detections": detections,
+                    "deterministic_findings": claims,
+                    "tool_catalog": self.TOOL_CATALOG,
+                    "response_contract": {
+                        "tool_calls": [{
+                            "name": "get_event|get_host_activity|get_service_activity|get_correlated_events",
+                            "arguments": {},
+                        }],
+                        "preliminary_findings": [{
+                            "claim": "string",
+                            "evidence_event_ids": ["event id"],
+                            "confidence": "low|medium|high",
+                        }],
+                        "narrative": "string",
+                    },
+                }))
+            except Exception as exc:
+                reasoner_error = f"{type(exc).__name__}: {exc}"
+                trace.append({
+                    "tool": "reasoner",
+                    "status": "error",
+                    "error": reasoner_error,
+                    "evidence_refs": [],
+                })
+
             model_response = first_response
             requested_tools = first_response.get("tool_calls", [])
             if not isinstance(requested_tools, list):
@@ -1149,12 +1168,22 @@ class AgenticInvestigationAgent:
 
             tool_results = []
             allowed_event_ids = set(incident["event_ids"])
+            allowed_arguments = {
+                "get_event": {"event_id"},
+                "get_host_activity": {"host_ip"},
+                "get_service_activity": {"destination_port", "protocol"},
+                "get_correlated_events": {"event_id", "relation_contains"},
+            }
             for request in requested_tools[:5]:
                 if not isinstance(request, dict):
                     continue
                 name = request.get("name", request.get("tool"))
                 arguments = request.get("arguments", {})
-                if name not in self.available_tools or not isinstance(arguments, dict):
+                if (
+                    not isinstance(name, str)
+                    or name not in self.available_tools
+                    or not isinstance(arguments, dict)
+                ):
                     trace.append({
                         "tool": str(name),
                         "status": "rejected",
@@ -1162,7 +1191,27 @@ class AgenticInvestigationAgent:
                         "evidence_refs": [],
                     })
                     continue
+
                 arguments = dict(arguments)
+                requested_incident = arguments.pop("incident_id", incident_id)
+                if requested_incident != incident_id:
+                    trace.append({
+                        "tool": name,
+                        "status": "rejected",
+                        "error": "Cross-incident tool access is not permitted.",
+                        "evidence_refs": [],
+                    })
+                    continue
+                unexpected = set(arguments) - allowed_arguments[name]
+                if unexpected:
+                    trace.append({
+                        "tool": name,
+                        "arguments": arguments,
+                        "status": "rejected",
+                        "error": f"Unexpected tool arguments: {sorted(unexpected)}",
+                        "evidence_refs": [],
+                    })
+                    continue
                 if name == "get_event":
                     requested_id = str(arguments.get("event_id", ""))
                     if requested_id not in allowed_event_ids:
@@ -1174,39 +1223,72 @@ class AgenticInvestigationAgent:
                             "evidence_refs": [],
                         })
                         continue
-                if name != "get_event":
-                    arguments.setdefault("incident_id", incident_id)
-                result = self._record_call(trace, name, arguments, self.available_tools[name])
+                else:
+                    # Never trust an incident ID supplied by the model.
+                    arguments["incident_id"] = incident_id
+
+                result = self._record_call(
+                    trace, name, arguments, self.available_tools[name]
+                )
                 if result is not None:
-                    tool_results.append({"tool": name, "arguments": arguments, "result": result})
+                    tool_results.append({
+                        "tool": name,
+                        "arguments": arguments,
+                        "result": result,
+                    })
 
             if tool_results:
-                model_response = self._decode_reasoner_response(self.reasoner({
-                    "task": (
-                        "Complete the SOC investigation using only this evidence. Return a concise "
-                        "incident explanation, findings with exact event IDs, uncertainty/caveats, "
-                        "and recommended analyst actions. Do not invent users, process execution, "
-                        "successful logins, exfiltration or business impact."
-                    ),
-                    "incident": incident,
-                    "initial_evidence": {"timeline": timeline, "graph": graph, "detections": detections},
-                    "deterministic_findings": claims,
-                    "additional_tool_results": tool_results,
-                }))
+                try:
+                    model_response = self._decode_reasoner_response(self.reasoner({
+                        "task": (
+                            "Complete the SOC investigation using only this evidence. Return a concise "
+                            "incident explanation, findings with exact event IDs, uncertainty/caveats, "
+                            "and recommended analyst actions. Do not invent users, process execution, "
+                            "successful logins, exfiltration or business impact."
+                        ),
+                        "incident": incident,
+                        "initial_evidence": {
+                            "timeline": timeline,
+                            "graph": graph,
+                            "detections": detections,
+                        },
+                        "deterministic_findings": claims,
+                        "additional_tool_results": tool_results,
+                    }))
+                except Exception as exc:
+                    reasoner_error = f"{type(exc).__name__}: {exc}"
+                    trace.append({
+                        "tool": "reasoner_final_synthesis",
+                        "status": "error",
+                        "error": reasoner_error,
+                        "evidence_refs": [],
+                    })
+                    model_response = first_response
 
             if model_response.get("narrative"):
                 narrative = str(model_response["narrative"])
             preliminary = model_response.get(
-                "findings", model_response.get("preliminary_findings", [])
+                "findings",
+                model_response.get(
+                    "preliminary_findings",
+                    first_response.get("preliminary_findings", []),
+                ),
             )
             if isinstance(preliminary, list):
                 for finding in preliminary:
                     if not isinstance(finding, dict):
                         continue
-                    event_refs = [str(value) for value in finding.get("evidence_event_ids", [])]
-                    if event_refs and set(event_refs).issubset(allowed_event_ids):
+                    event_refs = [
+                        str(value) for value in finding.get("evidence_event_ids", [])
+                    ]
+                    claim_text = str(finding.get("claim", finding.get("finding", ""))).strip()
+                    if (
+                        claim_text
+                        and event_refs
+                        and set(event_refs).issubset(allowed_event_ids)
+                    ):
                         model_findings.append({
-                            "claim": str(finding.get("claim", finding.get("finding", ""))),
+                            "claim": claim_text,
                             "evidence_event_ids": event_refs,
                             "evidence_edges": [],
                             "confidence": str(finding.get("confidence", "low")).lower(),
@@ -1216,14 +1298,24 @@ class AgenticInvestigationAgent:
                         trace.append({
                             "tool": "validate_model_finding",
                             "status": "rejected",
-                            "error": "Finding lacks valid event references or cites events outside this incident.",
+                            "error": (
+                                "Finding lacks a non-empty claim and valid event references, "
+                                "or cites events outside this incident."
+                            ),
                             "evidence_refs": [],
                         })
 
         all_findings = claims + model_findings
         return {
             "agent": "AgenticInvestigationAgent",
-            "mode": "tool_assisted_llm" if self.reasoner is not None else "tool_assisted_deterministic",
+            "mode": (
+                "tool_assisted_deterministic"
+                if self.reasoner is None
+                else "tool_assisted_llm_fallback"
+                if reasoner_error is not None
+                else "tool_assisted_llm"
+            ),
+            "reasoner_error": reasoner_error,
             "status": "completed",
             "plan": [
                 "retrieve_incident_context",
