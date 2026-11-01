@@ -721,6 +721,13 @@ def run(
     suspicious_path = out / "suspicious_flows_with_metadata.csv"
     suspicious.to_csv(suspicious_path, index=False)
 
+    # Port-scan-only rows are retained in a secondary analyst-review queue.
+    # Weak fan-out/horizontal-scan/DoS heuristics remain in the full prediction
+    # table as context signals and never independently create incidents.
+    review_only = df[df["review_candidate"] & ~df["alert"]].copy()
+    review_path = out / "review_candidates_with_metadata.csv"
+    review_only.to_csv(review_path, index=False)
+
     # Specialist graph analyst, threat-hunting and triage stages coordinate
     # event formation, topology analysis and evidence-backed reporting.
     pipeline_context = {
@@ -744,16 +751,25 @@ def run(
         },
         "behavioural_detection": {
             "rule_alert_flows": int(df["rule_alert"].sum()),
-            "rules": sorted({
-                reason
-                for value in df["detection_reasons"].fillna("").astype(str)
-                for reason in value.split(";")
-                if reason and reason != "ISOLATION_FOREST_ANOMALY"
-            }),
+            "review_only_flows": int(len(review_only)),
+            "context_signal_flows": int(df["context_signals"].fillna("").astype(str).ne("").sum()),
+            "actionable_rules": ["BRUTE_FORCE_PATTERN"],
+            "review_rules": ["PORT_SCAN"],
+            "context_only_rules": [
+                "HIGH_SOURCE_FANOUT",
+                "HORIZONTAL_SCAN",
+                "DISTRIBUTED_DOS_PATTERN",
+            ],
+            "review_output": str(review_path.name),
+            "policy_note": (
+                "Rule policy informed by CICIDS2017 validation metrics; "
+                "weak heuristics are context-only, port scan is review-only."
+            ),
         },
         "alert_fusion": {
             "combined_alert_flows": int(df["alert"].sum()),
-            "model_and_rule_or_logic": True,
+            "review_only_flows": int(len(review_only)),
+            "model_and_actionable_rule_or_logic": True,
         },
     }
     events, graph, investigation_summary = run_soc_investigation(
