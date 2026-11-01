@@ -110,10 +110,15 @@ def test_graph_links_shared_target_and_host_pivot_for_soc_chain(tmp_path):
     summary = run_soc_investigation(flows, tmp_path)
     report = (tmp_path / "incident_investigation_report.md").read_text()
     payload = json.loads((tmp_path / "incident_investigation.json").read_text())
-    assert summary[2]["incident_count"] == 1
+    assert summary[2]["incident_count"] == 2
     assert "T1110" in report
     assert "pivot hosts" in report
-    assert payload["incidents"][0]["graph_analysis"]["pivot_hosts"] == ["B"]
+    pivot_incidents = [
+        item for item in payload["incidents"]
+        if item["graph_analysis"]["pivot_hosts"] == ["B"]
+    ]
+    assert len(pivot_incidents) == 1
+    assert pivot_incidents[0]["attack_hypotheses"]
 
 
 def test_incident_graph_and_agent_tools_share_one_incident_id(tmp_path):
@@ -359,7 +364,10 @@ def test_explicit_correlation_table_is_the_incident_formation_input():
         events,
         correlations.iloc[0:0],
     ).form()
-    assert len(disconnected) == 2
+    # The standalone brute-force candidate is retained; the isolated
+    # context-only event is not promoted into an incident.
+    assert len(disconnected) == 1
+    assert set(disconnected[0][1]) == {"event:EVT-000001"}
 
 
 def test_model_detection_reason_is_added_exactly_once_for_all_alert_combinations():
@@ -540,3 +548,212 @@ def test_saved_prediction_replay_skips_model_refit(tmp_path):
     assert (output / "review_candidates_with_metadata.csv").exists()
     assert (output / "incident_investigation_report.md").exists()
 
+
+def _event(event_id, minute, src, dst, port=443, reasons="ISOLATION_FOREST_ANOMALY"):
+    timestamp = pd.Timestamp(_time(minute), tz="UTC")
+    return {
+        "event_id": event_id,
+        "start_time": timestamp,
+        "end_time": timestamp,
+        "src_ip": src,
+        "dst_ip": dst,
+        "protocol": "6",
+        "flow_count": 1,
+        "dst_ports": [port],
+        "detection_reasons": reasons,
+        "review_reasons": "",
+        "context_signals": "",
+    }
+
+
+def _edge(source, target, relation, gap=0):
+    return {
+        "from_event": source,
+        "to_event": target,
+        "relation": relation,
+        "gap_seconds": gap,
+        "overlap_seconds": 0,
+        "shared_entity": None,
+        "pivot_host": None,
+    }
+
+
+def test_same_service_and_same_target_links_do_not_form_incidents():
+    events = pd.DataFrame([
+        _event("E1", 0, "A", "B", 443),
+        _event("E2", 0, "C", "D", 443),
+        _event("E3", 0, "X", "B", 8443),
+    ])
+    correlations = pd.DataFrame([
+        _edge("E1", "E2", "same_service_temporal", 0),
+        _edge("E1", "E3", "same_target_temporal", 0),
+    ])
+
+    formed = IncidentFormationAgent(events, correlations).form()
+
+    assert formed == []
+
+
+def test_incident_formation_uses_only_short_same_source_and_host_pivot_edges():
+    events = pd.DataFrame([
+        _event("E1", 0, "A", "B"),
+        _event("E2", 0, "A", "C"),
+        _event("E3", 0, "B", "D"),
+    ])
+    correlations = pd.DataFrame([
+        _edge("E1", "E2", "same_source_temporal", 30),
+        _edge("E2", "E3", "host_pivot", 60),
+    ])
+
+    formed = IncidentFormationAgent(events, correlations).form()
+
+    assert len(formed) == 1
+    assert formed[0][1] == {"event:E1", "event:E2", "event:E3"}
+
+
+def test_incident_formation_caps_transitive_campaign_duration():
+    events = pd.DataFrame([
+        _event(f"E{i:02d}", minute=i, src="A", dst=f"D{i}")
+        for i in range(17)
+    ])
+    correlations = pd.DataFrame([
+        _edge(f"E{i:02d}", f"E{i+1:02d}", "same_source_temporal", 60)
+        for i in range(16)
+    ])
+
+    formed = IncidentFormationAgent(
+        events,
+        correlations,
+        max_campaign_duration_seconds=900,
+    ).form()
+
+    assert len(formed) == 1
+    assert len(formed[0][1]) == 16
+    assert formed[0][2]["start_time"].min() == pd.Timestamp(_time(0), tz="UTC")
+    assert (
+        formed[0][2]["end_time"].max()
+        - formed[0][2]["start_time"].min()
+    ).total_seconds() == 900
+
+
+def test_singleton_anomaly_is_not_incident_but_brute_force_candidate_is():
+    events = pd.DataFrame([
+        _event("ANOMALY", 0, "A", "B"),
+        _event("BRUTE", 1, "C", "D", 22, "BRUTE_FORCE_PATTERN"),
+    ])
+
+    formed = IncidentFormationAgent(
+        events,
+        pd.DataFrame(columns=[
+            "from_event", "to_event", "relation", "gap_seconds",
+            "overlap_seconds", "shared_entity", "pivot_host"
+        ]),
+    ).form()
+
+    assert len(formed) == 1
+    assert formed[0][1] == {"event:BRUTE"}
+
+
+def test_network_only_triage_cannot_claim_high_confidence_or_critical_severity():
+    rows = pd.DataFrame({
+        "detection_reasons": ["ISOLATION_FOREST_ANOMALY"] * 20,
+        "review_reasons": [""] * 20,
+    })
+    graph_data = {
+        "max_source_fanout": 100,
+        "max_target_fanin": 100,
+        "unique_services": 100,
+        "graph_event_links": 500,
+        "pivot_hosts": ["A"],
+    }
+
+    triage = __import__(
+        "attack_graph.soc_investigation",
+        fromlist=["IncidentTriageAgent"],
+    ).IncidentTriageAgent.score(rows, graph_data, [], 0.5)
+
+    assert triage["confidence"] == "LOW"
+    assert triage["severity"] == "MEDIUM"
+    assert triage["independent_signal_count"] == 0
+    assert triage["priority_score"] == triage["risk_score"]
+
+
+def test_two_external_telemetry_categories_can_raise_confidence():
+    rows = pd.DataFrame({
+        "detection_reasons": ["BRUTE_FORCE_PATTERN"] * 4,
+        "review_reasons": [""] * 4,
+        "external_evidence_sources": ["EDR;IDENTITY"] * 4,
+    })
+    graph_data = {
+        "max_source_fanout": 2,
+        "max_target_fanin": 2,
+        "unique_services": 1,
+        "graph_event_links": 1,
+        "pivot_hosts": [],
+    }
+
+    from attack_graph.soc_investigation import IncidentTriageAgent
+    triage = IncidentTriageAgent.score(rows, graph_data, [], 0.5)
+
+    assert triage["confidence"] == "HIGH"
+    assert triage["external_corroboration_sources"] == ["EDR", "IDENTITY"]
+
+
+def test_t1021_requires_remote_service_port_on_exact_inbound_pivot_edge():
+    from attack_graph.soc_investigation import ThreatHuntingAgent
+
+    rows = pd.DataFrame([
+        _event("A1", 0, "SRC", "PIVOT", 80),
+        _event("A2", 1, "PIVOT", "DEST", 443),
+        _event("B1", 2, "OTHER", "HOST", 3389),
+        _event("B2", 3, "HOST", "DEST2", 443),
+    ])
+    graph_data = {
+        "pivot_hosts": ["PIVOT", "HOST"],
+        "destination_ports": [80, 443, 3389],
+        "chain_edges": [
+            {
+                "from_event": "A1", "to_event": "A2",
+                "relation": "host_pivot", "pivot_host": "PIVOT",
+                "gap_seconds": 60,
+            },
+            {
+                "from_event": "B1", "to_event": "B2",
+                "relation": "host_pivot", "pivot_host": "HOST",
+                "gap_seconds": 60,
+            },
+        ],
+    }
+
+    hypotheses = ThreatHuntingAgent.analyse(rows, graph_data)
+    remote = [item for item in hypotheses if item["technique_id"] == "T1021"]
+
+    assert remote == []
+
+
+def test_t1021_evidence_contains_only_exact_remote_service_pivot_pair():
+    from attack_graph.soc_investigation import ThreatHuntingAgent
+
+    rows = pd.DataFrame([
+        _event("IN", 0, "SRC", "PIVOT", 22),
+        _event("OUT", 1, "PIVOT", "DEST", 443),
+        _event("UNRELATED", 2, "X", "Y", 3389),
+    ])
+    graph_data = {
+        "pivot_hosts": ["PIVOT"],
+        "destination_ports": [22, 443, 3389],
+        "chain_edges": [
+            {
+                "from_event": "IN", "to_event": "OUT",
+                "relation": "host_pivot", "pivot_host": "PIVOT",
+                "gap_seconds": 60,
+            },
+        ],
+    }
+
+    hypotheses = ThreatHuntingAgent.analyse(rows, graph_data)
+    remote = [item for item in hypotheses if item["technique_id"] == "T1021"]
+
+    assert len(remote) == 1
+    assert remote[0]["evidence_event_ids"] == ["IN", "OUT"]
+    assert remote[0]["evidence_edges"][0]["remote_service_ports"] == [22]
