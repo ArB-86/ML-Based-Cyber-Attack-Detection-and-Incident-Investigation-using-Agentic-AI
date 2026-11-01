@@ -468,10 +468,22 @@ class GraphAnalystAgent:
             "destination_ports": dst_ports,
             "max_source_fanout": int(max(src_fanout.values(), default=0)),
             "max_target_fanin": int(max(dst_fanin.values(), default=0)),
-            "top_sources": [{"ip": str(ip), "unique_targets": int(n)}
-                            for ip, n in sorted(src_fanout.items(), key=lambda x: (-x[1], str(x[0])))[:5]],
-            "top_targets": [{"ip": str(ip), "unique_sources": int(n)}
-                            for ip, n in sorted(dst_fanin.items(), key=lambda x: (-x[1], str(x[0])))[:5]],
+            "top_sources": [
+                {
+                    "ip": str(ip),
+                    "unique_targets": int(n),
+                    "event_ids": rows.loc[rows["src_ip"].eq(ip), "event_id"].astype(str).tolist(),
+                }
+                for ip, n in sorted(src_fanout.items(), key=lambda x: (-x[1], str(x[0])))[:5]
+            ],
+            "top_targets": [
+                {
+                    "ip": str(ip),
+                    "unique_sources": int(n),
+                    "event_ids": rows.loc[rows["dst_ip"].eq(ip), "event_id"].astype(str).tolist(),
+                }
+                for ip, n in sorted(dst_fanin.items(), key=lambda x: (-x[1], str(x[0])))[:5]
+            ],
             "pivot_hosts": sorted(pivots),
             "chain_edges": sorted(links, key=lambda x: (x["from_event"], x["to_event"])),
             "assets": sorted(set(rows["src_ip"].astype(str)) | set(rows["dst_ip"].astype(str))),
@@ -484,11 +496,33 @@ class ThreatHuntingAgent:
     def analyse(rows: pd.DataFrame, graph_data: dict[str, Any]) -> list[dict[str, str]]:
         reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
         hypotheses = []
+        event_ids = rows["event_id"].astype(str)
+        reasons_by_event = rows.get(
+            "detection_reasons", pd.Series("", index=rows.index)
+        ).fillna("").astype(str)
+        scan_ids = event_ids[
+            reasons_by_event.str.contains(
+                r"PORT_SCAN|HORIZONTAL_SCAN|HIGH_SOURCE_FANOUT", regex=True
+            )
+        ].tolist()
+        dos_ids = event_ids[
+            reasons_by_event.str.contains("DISTRIBUTED_DOS_PATTERN", regex=False)
+        ].tolist()
+        brute_ids = event_ids[
+            reasons_by_event.str.contains("BRUTE_FORCE_PATTERN", regex=False)
+        ].tolist()
+        pivot_ids = sorted({
+            event_id
+            for edge in graph_data["chain_edges"]
+            if "host_pivot" in edge["relation"]
+            for event_id in (edge["from_event"], edge["to_event"])
+        })
         if reasons.intersection({"PORT_SCAN", "HORIZONTAL_SCAN", "HIGH_SOURCE_FANOUT"}):
             hypotheses.append({
                 "technique_id": "T1046", "technique": "Network Service Discovery",
                 "confidence": "medium",
                 "evidence": "A source probed multiple destination services or hosts in a bounded time window.",
+                "evidence_event_ids": scan_ids,
                 "caveat": "Check authorised scanner schedules, firewall and IDS telemetry.",
             })
         if "DISTRIBUTED_DOS_PATTERN" in reasons or graph_data["max_target_fanin"] >= 15:
@@ -496,6 +530,11 @@ class ThreatHuntingAgent:
                 "technique_id": "T1498", "technique": "Network Denial of Service",
                 "confidence": "medium",
                 "evidence": "A destination received flows from many distinct sources in a bounded interval.",
+                "evidence_event_ids": dos_ids or [
+                    event_id
+                    for lead in graph_data["top_targets"][:1]
+                    for event_id in lead["event_ids"]
+                ],
                 "caveat": "Flow metadata alone does not establish service impact or malicious intent.",
             })
         if "BRUTE_FORCE_PATTERN" in reasons:
@@ -503,6 +542,7 @@ class ThreatHuntingAgent:
                 "technique_id": "T1110", "technique": "Brute Force",
                 "confidence": "medium",
                 "evidence": "Repeated flows targeted an authentication service from one source to one destination.",
+                "evidence_event_ids": brute_ids,
                 "caveat": "Authentication success/failure logs are required to confirm credential guessing.",
             })
         if graph_data["pivot_hosts"] and {22, 445, 3389, 5985, 5986, 5900}.intersection(graph_data["destination_ports"]):
@@ -510,6 +550,7 @@ class ThreatHuntingAgent:
                 "technique_id": "T1021", "technique": "Remote Services",
                 "confidence": "low",
                 "evidence": "A host was targeted and later initiated another related flow involving a remote-access port.",
+                "evidence_event_ids": pivot_ids,
                 "caveat": "A pivot is an investigation lead, not proof of lateral movement.",
             })
         return hypotheses
@@ -913,23 +954,25 @@ class AgenticInvestigationAgent:
             })
 
         analysis = incident["graph_analysis"]
-        if analysis["max_source_fanout"] > 1:
+        if analysis["max_source_fanout"] > 1 and analysis["top_sources"]:
+            lead = analysis["top_sources"][0]
             claims.append({
                 "claim": (
-                    f"The most active source contacted {analysis['max_source_fanout']} "
-                    "distinct destinations within the candidate incident."
+                    f"Source {lead['ip']} contacted {lead['unique_targets']} "
+                    "distinct destinations within this incident."
                 ),
-                "evidence_event_ids": list(incident["event_ids"]),
+                "evidence_event_ids": list(lead["event_ids"]),
                 "evidence_edges": [],
                 "confidence": "medium",
             })
-        if analysis["max_target_fanin"] > 1:
+        if analysis["max_target_fanin"] > 1 and analysis["top_targets"]:
+            lead = analysis["top_targets"][0]
             claims.append({
                 "claim": (
-                    f"The most targeted destination received traffic from "
-                    f"{analysis['max_target_fanin']} distinct sources."
+                    f"Destination {lead['ip']} received traffic from "
+                    f"{lead['unique_sources']} distinct sources."
                 ),
-                "evidence_event_ids": list(incident["event_ids"]),
+                "evidence_event_ids": list(lead["event_ids"]),
                 "evidence_edges": [],
                 "confidence": "medium",
             })
