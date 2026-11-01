@@ -1448,6 +1448,41 @@ def _ask_llm(
                 "Only the supplied event table and optional graph were examined.",
             ],
         }
+        # If the model schema-repair attempt fails, preserve the same graph-first
+        # assessment as the normal report path instead of falling back to an
+        # Isolation-Forest-led generic summary.
+        graph_assessment = prompt_data.get("soc_graph_assessment", {})
+        if isinstance(graph_assessment, dict) and graph_assessment:
+            fallback["summary"] = graph_assessment.get(
+                "executive_assessment", fallback["summary"]
+            )
+            graph_findings = graph_assessment.get("key_findings", [])
+            if isinstance(graph_findings, list) and graph_findings:
+                fallback["observed_evidence"] = graph_findings[:8] + facts[-1:]
+            graph_hypotheses = graph_assessment.get("hypotheses", [])
+            if isinstance(graph_hypotheses, list) and graph_hypotheses:
+                fallback["hypotheses"] = graph_hypotheses[:3]
+            graph_timeline = graph_assessment.get("temporal_sequence", [])
+            if isinstance(graph_timeline, list) and graph_timeline:
+                fallback["timeline"] = [
+                    {
+                        "time": str(item.get("start_time") or "unknown"),
+                        "event": (
+                            f"{item.get('event_id')} — {item.get('attack_type')} "
+                            f"({item.get('src_ip')} -> {item.get('dst_ip')})"
+                        ),
+                        "evidence": "Derived only from explicit graph 'precedes' relationships.",
+                    }
+                    for item in graph_timeline[:40]
+                ]
+            fallback["risk_rationale"] = (
+                f"Graph-pattern confidence: {graph_assessment.get('graph_pattern_confidence', 'not established')} "
+                f"Operational impact: {graph_assessment.get('impact_status', 'unknown')}"
+            )
+            graph_recommendations = graph_assessment.get("recommended_investigations", [])
+            if isinstance(graph_recommendations, list) and graph_recommendations:
+                fallback["recommended_next_steps"] = graph_recommendations[:5]
+
         # Do not mix potentially unsupported text from a partial LLM response
         # with deterministic fallback fields. If one repair attempt still leaves
         # required keys missing, replace the entire report with grounded defaults.
