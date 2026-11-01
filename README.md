@@ -5,7 +5,7 @@ This repository contains a CICIDS2017 Isolation Forest benchmark and an evidence
 ## SOC workflow
 
 1. Detection: Isolation Forest provides an unsupervised anomaly signal. Independent metadata-based behavioural rules can also raise alerts.
-2. Event formation: detector alerts are grouped by source, destination, protocol and temporal proximity. The operational event builder does not use the CICIDS ground-truth Label column.
+2. Event formation: detector alerts are grouped by source, destination, protocol and temporal proximity. The operational event builder does not use the CICIDS ground-truth Label column. Distinct source/destination IPs, ports and timestamps are retained during metadata-path deduplication, even when numeric flow features match.
 3. Attack graph: typed host, event, service and detection nodes are connected through shared-source, shared-destination, shared-service and target-to-source host-pivot relationships.
 4. SOC investigation: specialist stages analyse graph topology, create cautious MITRE ATT&CK hypotheses, score incident priority and produce evidence-backed response recommendations.
 5. Reporting: CSV and JSON retain the evidence. The Markdown report includes a prioritised incident queue, source/target concentration, graph links, event timelines, ATT&CK hypotheses, caveats and analyst actions.
