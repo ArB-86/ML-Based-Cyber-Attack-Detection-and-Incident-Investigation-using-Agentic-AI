@@ -35,6 +35,12 @@ Run on the eight metadata-rich CICIDS2017 CSV files:
 
     python -m attack_graph.pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --output-dir "soc_output"
 
+To replay an updated detector policy and SOC investigation using an existing prediction artefact without retraining Isolation Forest:
+
+    python -m attack_graph.pipeline --reuse-predictions "soc_output\\cicids_if_predictions_with_metadata.csv" --output-dir "soc_output_policy_v2"
+
+Replay mode requires the saved `predicted_anomaly` flags. It reuses the original model outputs, reruns behavioural rule policy and rebuilds the downstream event, graph and incident artefacts. It does not refit Isolation Forest or recalculate model performance metrics.
+
 To additionally verify the historical notebook benchmark before running the SOC pipeline:
 
     python -m attack_graph.pipeline "D:\MAJOR PROJECT\cicids_metadata\generated_flows" --benchmark-parquet "D:\MAJOR PROJECT\cleaned_cicids2017.parquet" --output-dir "soc_output"
@@ -60,19 +66,21 @@ To run only the historical benchmark verifier:
 | Investigation agent | Incident dossier plus read-only tools | Incident, event timeline, graph neighbourhood and detection-provenance retrieval; tool trace and evidence-linked findings |
 | Reporting | Full structured incident context | Incident CSV/JSON, correlation CSV, GEXF, Markdown and stage manifest |
 
-### Behavioural detections
+### Behavioural detections and alert policy
 
-These independent rules complement Isolation Forest and never read the CICIDS ground-truth `Label` during alert selection.
+All behavioural rules are computed independently of the CICIDS ground-truth `Label`. Their output is separated into three tiers based on the observed validation results from this dataset:
 
-| Rule | Default condition within a 5-minute bucket |
-|---|---|
-| Port scan | One source probes at least 10 destination ports on one destination |
-| Horizontal scan | One source probes at least 10 distinct destinations on the same destination port |
-| High source fan-out | One source communicates with at least 15 distinct destinations |
-| Distributed DoS pattern | One destination receives at least 40 flows from at least 15 distinct sources |
-| Brute-force pattern | At least 12 flows from one source to one destination on a common authentication port |
+| Rule | Default condition within a 5-minute bucket | Current policy tier |
+|---|---|---|
+| Brute-force pattern | At least 12 flows from one source to one destination on a common authentication port | Actionable rule candidate |
+| Port scan | One source probes at least 10 destination ports on one destination | Secondary analyst-review queue |
+| High source fan-out | One source communicates with at least 15 distinct destinations | Context only |
+| Horizontal scan | One source probes at least 10 distinct destinations on the same destination port | Context only |
+| Distributed DoS pattern | One destination receives at least 40 flows from at least 15 distinct sources | Context only |
 
-These are hunt heuristics, not calibrated classifiers. Fixed time buckets can miss behaviour crossing a boundary; streaming deployment needs stateful rolling windows and network-specific threshold calibration.
+The current policy combines Isolation Forest alerts with the brute-force rule for primary incident selection. Port-scan-only rows are written to `review_candidates_with_metadata.csv` and do not independently create incidents. The remaining weak heuristics are retained in `context_signals` / `matched_rule_reasons` for evidence and offline analysis, but do not independently raise alerts or create ATT&CK hypotheses.
+
+This is a provisional CICIDS2017 benchmark policy, not a production-calibrated rule set. The observed validation precision/false-positive rates motivated the tiering; thresholds and policy must be revalidated on representative operational telemetry. Fixed time buckets can miss behaviour crossing a boundary; streaming deployment needs stateful rolling windows and network-specific calibration.
 
 ### Correlation and incident formation
 
@@ -104,8 +112,9 @@ The callback contract is `reasoner(context: dict) -> str | dict`. For model-dire
 | File | Contents |
 |---|---|
 | `cicids_if_predictions_with_metadata.csv` | Flow-level model scores, rule flags and unified alert decision |
-| `suspicious_flows_with_metadata.csv` | All model OR behavioural-rule alerts, including benign-labelled false positives |
-| `attack_events.csv` | Detector-derived event records |
+| `suspicious_flows_with_metadata.csv` | Primary Isolation Forest OR actionable brute-force rule alerts, including benign-labelled false positives |
+| `review_candidates_with_metadata.csv` | Port-scan-only secondary review candidates; not promoted into primary incidents |
+| `attack_events.csv` | Primary-alert event records with detection, review and context provenance |
 | `event_correlations.csv` | Event-to-event relationship evidence, time gaps and pivot hosts |
 | `attack_graph.gexf` | Incident-linked graph for Gephi or compatible viewers |
 | `incident_investigation.csv` | Event-to-incident assignments and incident-level triage |
