@@ -71,9 +71,13 @@ def build_soc_events(
     if work.empty:
         return pd.DataFrame(columns=columns)
 
+    if work[["src_ip", "dst_ip", "protocol"]].isna().any().any():
+        raise ValueError("SOC event builder received missing source, destination or protocol values.")
     work["src_ip"] = work["src_ip"].astype(str).str.strip()
     work["dst_ip"] = work["dst_ip"].astype(str).str.strip()
     work["protocol"] = work["protocol"].astype(str).str.strip()
+    if (work["src_ip"].eq("") | work["dst_ip"].eq("") | work["protocol"].eq("")).any():
+        raise ValueError("SOC event builder received blank source, destination or protocol values.")
     if "src_port" not in work.columns:
         work["src_port"] = pd.NA
     if "dst_port" not in work.columns:
@@ -1581,6 +1585,13 @@ def run_soc_investigation_from_events(
     missing = required - set(events.columns)
     if missing:
         raise ValueError(f"Event contract is missing columns: {sorted(missing)}")
+    if events["event_id"].isna().any():
+        raise ValueError("Event contract contains null event IDs.")
+    event_ids = events["event_id"].astype(str)
+    if event_ids.eq("").any() or event_ids.duplicated().any():
+        raise ValueError("Event contract requires non-empty, unique event IDs.")
+    if events[["src_ip", "dst_ip", "protocol"]].isna().any().any():
+        raise ValueError("Event contract contains missing endpoint or protocol values.")
     if "detection_reasons" not in events.columns:
         events["detection_reasons"] = "LEGACY_EVENT_IMPORT"
     if "alert_sources" not in events.columns:
@@ -1596,6 +1607,13 @@ def run_soc_investigation_from_events(
             events[column] = pd.to_datetime(events[column], errors="coerce", utc=True, format="mixed")
     if not events.empty and events[["start_time", "end_time"]].isna().any().any():
         raise ValueError("Event contract contains invalid timestamps.")
+    if not events.empty and (events["end_time"] < events["start_time"]).any():
+        raise ValueError("Event contract contains end_time earlier than start_time.")
+    events["flow_count"] = pd.to_numeric(events["flow_count"], errors="coerce")
+    if not events.empty and (
+        events["flow_count"].isna().any() or (events["flow_count"] < 1).any()
+    ):
+        raise ValueError("Event contract requires positive numeric flow_count values.")
 
     events.to_csv(out / "attack_events.csv", index=False)
     correlations = EventCorrelationAgent(events, max_gap_seconds=300).correlate()
