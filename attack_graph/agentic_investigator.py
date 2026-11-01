@@ -635,7 +635,11 @@ def run_agentic_graph_tools(
                 "attack_type_event_count": overview.get("attack_type_cluster", {}).get("event_count", 0),
             },
             "previous_findings": [
-                {"tool": item["tool"], "purpose": item["purpose"], "result": item["result"]}
+                {
+                    "tool": item["tool"],
+                    "purpose": item["purpose"],
+                    "result": _compact_tool_result(item["result"], max_chars=4500),
+                }
                 for item in findings[-6:]
             ],
             "available_tools": catalog,
@@ -719,7 +723,10 @@ def run_agentic_graph_tools(
                 })
             executed_this_round += 1
 
-        if executed_this_round == 0 or not bool(plan.get("continue_investigation", False)):
+        continue_requested = bool(
+            plan.get("continue_investigation", round_number < rounds)
+        )
+        if executed_this_round == 0 or not continue_requested:
             break
 
     return {
@@ -729,6 +736,75 @@ def run_agentic_graph_tools(
         "tool_calls_executed": sum(1 for item in trace if item.get("status") == "success"),
         "trace": trace,
         "findings": findings,
+    }
+
+
+def _compact_tool_result(value: Any, max_chars: int = 7000) -> Any:
+    encoded = json.dumps(_json_safe(value), ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return _json_safe(value)
+    return {
+        "truncated": True,
+        "original_char_count": len(encoded),
+        "preview_json": encoded[:max_chars],
+    }
+
+
+def _compact_graph_analysis(overview: dict[str, Any]) -> dict[str, Any]:
+    neighborhood = overview.get("neighborhood", {})
+    shared = overview.get("shared_host_events", {})
+    temporal = overview.get("temporal_sequence", {})
+    component = overview.get("connected_component", {})
+    attack_cluster = overview.get("attack_type_cluster", {})
+    paths = overview.get("structural_paths", {})
+    return {
+        "graph_metrics": overview.get("graph_metrics", {}),
+        "neighborhood": {
+            "center_node": neighborhood.get("center_node"),
+            "hops_requested": neighborhood.get("hops_requested"),
+            "scope_truncated": neighborhood.get("scope_truncated"),
+            "node_count": neighborhood.get("node_count"),
+            "edge_count": neighborhood.get("edge_count"),
+            "nodes": neighborhood.get("nodes", [])[:35],
+            "edges": neighborhood.get("edges", [])[:55],
+            "event_ids": neighborhood.get("event_ids", [])[:40],
+        },
+        "shared_host_events": {
+            "relationship_count": shared.get("relationship_count", 0),
+            "relationships": [
+                {
+                    "host_node": item.get("host_node"),
+                    "role_for_selected_event": item.get("role_for_selected_event"),
+                    "related_event_id": item.get("related_event_id"),
+                }
+                for item in shared.get("relationships", [])[:35]
+            ],
+            "truncated": shared.get("truncated", False),
+        },
+        "temporal_sequence": {
+            "explicit_precedes_edges": temporal.get("explicit_precedes_edges", 0),
+            "ordering_basis": temporal.get("ordering_basis"),
+            "sequence": temporal.get("sequence", [])[:35],
+        },
+        "connected_component": {
+            "node_count": component.get("node_count", 0),
+            "event_count": component.get("event_count", 0),
+            "event_ids": component.get("event_ids", [])[:60],
+            "truncated_event_records": component.get("truncated_event_records", False),
+        },
+        "attack_type_cluster": {
+            "attack_type": attack_cluster.get("attack_type"),
+            "exists": attack_cluster.get("exists"),
+            "event_count": attack_cluster.get("event_count", 0),
+            "event_ids": attack_cluster.get("event_ids", [])[:60],
+        },
+        "structural_paths": {
+            "source": paths.get("source"),
+            "destination": paths.get("destination"),
+            "paths_returned": paths.get("paths_returned", 0),
+            "paths": paths.get("paths", [])[:8],
+            "interpretation": paths.get("interpretation"),
+        },
     }
 
 
@@ -801,8 +877,17 @@ def _make_prompt(
             "target_event": select_fields(target, event_fields),
             "detector_interpretation": _detector_context(target),
             "related_events_and_graph": compact_evidence,
-            "multi_hop_graph_analysis": evidence.get("graph_analysis", {}),
-            "agent_tool_findings": (agent_run or {}).get("findings", []),
+            "multi_hop_graph_analysis": _compact_graph_analysis(evidence.get("graph_analysis", {})),
+            "agent_tool_findings": [
+                {
+                    "round": item.get("round"),
+                    "tool": item.get("tool"),
+                    "purpose": item.get("purpose"),
+                    "arguments": item.get("arguments", {}),
+                    "result": _compact_tool_result(item.get("result", {})),
+                }
+                for item in (agent_run or {}).get("findings", [])[-6:]
+            ],
             "agent_tool_trace": (agent_run or {}).get("trace", []),
             "risk_assessment_if_available": risk_context if risk_context else None,
             "required_output_contract": {
