@@ -23,6 +23,8 @@ from sklearn.model_selection import train_test_split
 
 from .event_builder import EventConfig, build_attack_events, normalize_columns
 from .graph_builder import add_sequence_edges, build_attack_graph, write_attack_graph_gexf
+from .incident_investigator import run_investigation
+from .soc_detection import merge_detector_outputs
 
 
 LABEL_MAP = {
