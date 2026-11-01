@@ -148,20 +148,38 @@ def build_soc_events(
         })
     return pd.DataFrame(records, columns=columns)
 
+def _missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        marker = pd.isna(value)
+        return bool(marker) if not hasattr(marker, "__len__") else False
+    except (TypeError, ValueError):
+        return False
+
+
 def _add_edge(graph: nx.DiGraph, source: str, target: str, relation: str, **attrs: Any) -> None:
     if source == target:
         return
+    clean_attrs = {
+        key: value for key, value in attrs.items()
+        if not _missing_scalar(value)
+    }
     if graph.has_edge(source, target):
         existing = set(str(graph[source][target].get("relations", "")).split("|"))
         existing.add(relation)
         graph[source][target]["relations"] = "|".join(sorted(x for x in existing if x))
         graph[source][target]["relation"] = graph[source][target]["relations"]
-        for key, value in attrs.items():
-            if value is not None:
-                graph[source][target].setdefault(key, value)
+        for key, value in clean_attrs.items():
+            graph[source][target].setdefault(key, value)
     else:
-        graph.add_edge(source, target, relation=relation, relations=relation,
-                       **{key: value for key, value in attrs.items() if value is not None})
+        graph.add_edge(
+            source,
+            target,
+            relation=relation,
+            relations=relation,
+            **clean_attrs,
+        )
 
 
 CORRELATION_COLUMNS = [
@@ -384,11 +402,13 @@ def build_soc_graph(
             raise ValueError(
                 f"Correlation references unknown event IDs: {previous_id}, {current_id}"
             )
+        gap_seconds = edge.get("gap_seconds")
+        overlap_seconds = edge.get("overlap_seconds", 0.0)
         attrs = {
-            "gap_seconds": float(edge["gap_seconds"]),
-            "overlap_seconds": float(edge.get("overlap_seconds", 0.0) or 0.0),
-            "shared_entity": edge.get("shared_entity"),
-            "pivot_host": edge.get("pivot_host"),
+            "gap_seconds": None if _missing_scalar(gap_seconds) else float(gap_seconds),
+            "overlap_seconds": 0.0 if _missing_scalar(overlap_seconds) else float(overlap_seconds),
+            "shared_entity": None if _missing_scalar(edge.get("shared_entity")) else edge.get("shared_entity"),
+            "pivot_host": None if _missing_scalar(edge.get("pivot_host")) else edge.get("pivot_host"),
         }
         _add_edge(graph, source, target, str(edge["relation"]), **attrs)
     return graph
@@ -693,13 +713,18 @@ class SOCInvestigationOrchestrator:
             hypotheses = ThreatHuntingAgent.analyse(rows, graph_data)
             # A stored IF score is not an independent signal unless IF
             # actually fired an alert for this incident.
-            model_was_triggered = "ISOLATION_FOREST" in _tokens(
-                rows.get("alert_sources", pd.Series(dtype=object))
+            alert_sources = rows.get(
+                "alert_sources", pd.Series("", index=rows.index)
+            ).fillna("").astype(str)
+            model_event_mask = alert_sources.str.contains(
+                "ISOLATION_FOREST", case=False, regex=False
             )
-            values = (
-                [self.anomaly_strength[eid] for eid in ids if eid in self.anomaly_strength]
-                if model_was_triggered else []
-            )
+            model_event_ids = rows.loc[model_event_mask, "event_id"].astype(str).tolist()
+            values = [
+                self.anomaly_strength[event_id]
+                for event_id in model_event_ids
+                if event_id in self.anomaly_strength
+            ]
             anomaly_strength = None if not values else float(sum(values) / len(values))
             triage = IncidentTriageAgent.score(rows, graph_data, hypotheses, anomaly_strength)
             reasons = sorted(_tokens(rows.get("detection_reasons", pd.Series(dtype=object))))
