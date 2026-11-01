@@ -24,5 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-benchmark.txt
           python -m pip install pytest
+      - name: Compile Python modules
+        run: python -m compileall -q attack_graph tests
       - name: Run tests
+        env:
+          PYTHONPATH: .
         run: pytest -q
