@@ -22,7 +22,6 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 from .event_builder import normalize_columns
-from .graph_builder import write_attack_graph_gexf
 from .soc_detection import merge_detector_outputs
 from .soc_investigation import run_soc_investigation
 
@@ -699,13 +698,12 @@ def run(
     # event formation, topology analysis and evidence-backed reporting.
     events, graph, investigation_summary = run_soc_investigation(suspicious, out)
 
+    # The SOC orchestrator owns graph persistence after incident nodes and
+    # membership edges have been added. The model runner only records status.
     gexf_path = out / "attack_graph.gexf"
-    gexf_written = False
-    try:
-        write_attack_graph_gexf(graph, str(gexf_path))
-        gexf_written = gexf_path.exists() and gexf_path.stat().st_size > 0
-    except Exception as exc:
-        print(f"GEXF write failed: {exc}")
+    gexf_written = gexf_path.exists() and gexf_path.stat().st_size > 0
+    if not gexf_written:
+        raise RuntimeError("SOC orchestrator did not persist the incident attack graph.")
 
     png_status = "skipped"
     if graph.number_of_nodes() > 0 and graph.number_of_nodes() <= 800:
