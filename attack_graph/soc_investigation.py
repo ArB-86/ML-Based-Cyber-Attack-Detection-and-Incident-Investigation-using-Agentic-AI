@@ -28,14 +28,27 @@ def _tokens(values: pd.Series) -> set[str]:
     return found
 
 
-def build_soc_events(alert_flows: pd.DataFrame, event_gap_seconds: int = 60) -> pd.DataFrame:
-    """Group alert flows by endpoint pair and time. Ground-truth labels are never read."""
+def build_soc_events(
+    alert_flows: pd.DataFrame,
+    event_gap_seconds: int = 60,
+    max_flows_per_event: int = 5000,
+    use_ports_in_key: bool = False,
+) -> pd.DataFrame:
+    """Aggregate detector alerts into canonical, metadata-preserving events.
+
+    Ground-truth labels are never read. Grouping uses endpoint pair, protocol,
+    optional port pair, temporal gap and a maximum event size. Original input
+    row identifiers and detector provenance are retained for traceability.
+    """
     columns = [
-        "event_id", "start_time", "end_time", "duration_seconds", "src_ip", "dst_ip",
-        "protocol", "attack_type", "flow_count", "mean_anomaly_score", "min_anomaly_score",
-        "src_ports", "dst_ports", "unique_src_ports", "unique_dst_ports",
-        "detection_reasons", "alert_sources",
+        "event_id", "start_time", "end_time", "duration_seconds",
+        "src_ip", "dst_ip", "protocol", "attack_type", "flow_count",
+        "mean_anomaly_score", "min_anomaly_score", "src_ports", "dst_ports",
+        "unique_src_ports", "unique_dst_ports", "detection_reasons",
+        "alert_sources", "flow_row_ids",
     ]
+    if event_gap_seconds < 0 or max_flows_per_event < 1:
+        raise ValueError("Event gap must be non-negative and max_flows_per_event must be positive.")
     if alert_flows.empty:
         return pd.DataFrame(columns=columns)
 
@@ -45,25 +58,48 @@ def build_soc_events(alert_flows: pd.DataFrame, event_gap_seconds: int = 60) -> 
     missing = required - set(work.columns)
     if missing:
         raise ValueError(f"SOC event builder requires columns: {sorted(missing)}")
-    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce", utc=True, format="mixed")
+
+    work["_flow_row_id"] = work.index.astype(str)
+    work = work.reset_index(drop=True)
+    work["timestamp"] = pd.to_datetime(
+        work["timestamp"], errors="coerce", utc=True, format="mixed"
+    )
     if work["timestamp"].isna().any():
         raise ValueError("SOC event builder received invalid timestamps.")
-    work = work.loc[_bool_series(work["alert"])].copy()
+    work["alert"] = _bool_series(work["alert"])
+    work = work.loc[work["alert"]].copy()
     if work.empty:
         return pd.DataFrame(columns=columns)
+
     work["src_ip"] = work["src_ip"].astype(str).str.strip()
     work["dst_ip"] = work["dst_ip"].astype(str).str.strip()
+    work["protocol"] = work["protocol"].astype(str).str.strip()
+    if "src_port" not in work.columns:
+        work["src_port"] = pd.NA
+    if "dst_port" not in work.columns:
+        work["dst_port"] = pd.NA
+    if "anomaly_score" not in work.columns:
+        work["anomaly_score"] = pd.NA
+    if "detection_reasons" not in work.columns:
+        work["detection_reasons"] = "UNSPECIFIED_DETECTION"
+    if "alert_sources" not in work.columns:
+        work["alert_sources"] = "UNSPECIFIED_ALERT_SOURCE"
+
     work = work.sort_values("timestamp", kind="stable")
+    group_columns = ["src_ip", "dst_ip", "protocol"]
+    if use_ports_in_key:
+        group_columns.extend(["src_port", "dst_port"])
 
     groups: list[pd.DataFrame] = []
-    for _, group in work.groupby(["src_ip", "dst_ip", "protocol"], dropna=False, sort=True):
+    for _, group in work.groupby(group_columns, dropna=False, sort=True):
         group = group.sort_values("timestamp", kind="stable")
-        indices: list[Any] = []
+        indices: list[int] = []
         previous = None
         for index, row in group.iterrows():
             timestamp = row["timestamp"]
             gap = None if previous is None else (timestamp - previous).total_seconds()
-            if indices and gap > event_gap_seconds:
+            size_limit_reached = len(indices) >= max_flows_per_event
+            if indices and (gap > event_gap_seconds or size_limit_reached):
                 groups.append(group.loc[indices].copy())
                 indices = []
             indices.append(index)
@@ -71,14 +107,22 @@ def build_soc_events(alert_flows: pd.DataFrame, event_gap_seconds: int = 60) -> 
         if indices:
             groups.append(group.loc[indices].copy())
 
-    groups.sort(key=lambda rows: (rows["timestamp"].min(), str(rows["src_ip"].iloc[0]), str(rows["dst_ip"].iloc[0])))
+    groups.sort(
+        key=lambda rows: (
+            rows["timestamp"].min(),
+            str(rows["src_ip"].iloc[0]),
+            str(rows["dst_ip"].iloc[0]),
+            str(rows["protocol"].iloc[0]),
+        )
+    )
+
     records: list[dict[str, Any]] = []
     for number, rows in enumerate(groups, start=1):
-        reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object))) or {"UNSPECIFIED_DETECTION"}
-        sources = _tokens(rows.get("alert_sources", pd.Series(dtype=object)))
-        scores = pd.to_numeric(rows.get("anomaly_score", pd.Series(index=rows.index, dtype=float)), errors="coerce")
-        src_port_values = pd.to_numeric(rows.get("src_port", pd.Series(index=rows.index, dtype=float)), errors="coerce").dropna()
-        dst_port_values = pd.to_numeric(rows.get("dst_port", pd.Series(index=rows.index, dtype=float)), errors="coerce").dropna()
+        reasons = _tokens(rows["detection_reasons"]) or {"UNSPECIFIED_DETECTION"}
+        sources = _tokens(rows["alert_sources"])
+        scores = pd.to_numeric(rows["anomaly_score"], errors="coerce")
+        src_port_values = pd.to_numeric(rows["src_port"], errors="coerce").dropna()
+        dst_port_values = pd.to_numeric(rows["dst_port"], errors="coerce").dropna()
         src_ports = sorted({int(port) for port in src_port_values if 0 <= int(port) <= 65535})
         dst_ports = sorted({int(port) for port in dst_port_values if 0 <= int(port) <= 65535})
         start, end = rows["timestamp"].min(), rows["timestamp"].max()
@@ -100,9 +144,9 @@ def build_soc_events(alert_flows: pd.DataFrame, event_gap_seconds: int = 60) -> 
             "unique_dst_ports": len(dst_ports),
             "detection_reasons": ";".join(sorted(reasons)),
             "alert_sources": ";".join(sorted(sources)),
+            "flow_row_ids": [str(value) for value in rows["_flow_row_id"].tolist()],
         })
     return pd.DataFrame(records, columns=columns)
-
 
 def _add_edge(graph: nx.DiGraph, source: str, target: str, relation: str, **attrs: Any) -> None:
     if source == target:
