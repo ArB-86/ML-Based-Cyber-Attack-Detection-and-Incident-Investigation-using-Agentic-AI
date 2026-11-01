@@ -1437,9 +1437,15 @@ class AgenticInvestigationAgent:
         if name == "get_graph_neighborhood":
             return [item.removeprefix("event:") for item in result["member_event_nodes"]]
         if name == "get_detection_evidence":
+            evidence_maps = (
+                result.get("reason_to_event_ids", {}),
+                result.get("review_reason_to_event_ids", {}),
+                result.get("context_signal_to_event_ids", {}),
+            )
             return sorted({
                 event_id
-                for event_ids in result["reason_to_event_ids"].values()
+                for reason_map in evidence_maps
+                for event_ids in reason_map.values()
                 for event_id in event_ids
             })
         if isinstance(result, dict):
@@ -1555,7 +1561,7 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
     lines.extend([
         "## 4. Graph-analysis method", "",
         "The graph contains typed host, event, service and detection nodes. Events are linked independently by shared source, shared destination, shared destination service and target-to-source host pivots. Connected event components form candidate incidents. The analysis measures source fan-out, destination convergence, service diversity and temporal chains.", "",
-        "Isolation Forest contributes one supporting signal. Behavioural detections can independently raise alerts, while graph relationships provide investigation context. The risk score combines rule diversity, persistence, graph fan-out/convergence, service diversity and (when present) relative anomaly score. It is a prioritisation heuristic, not a probability.", "",
+        "Isolation Forest is a primary anomaly signal. The current CICIDS2017 validation-informed policy allows BRUTE_FORCE_PATTERN to create an actionable rule alert, routes PORT_SCAN to a separate review queue, and retains HIGH_SOURCE_FANOUT, HORIZONTAL_SCAN and DISTRIBUTED_DOS_PATTERN as context-only telemetry. These rules must be revalidated on representative operational data before deployment. Graph relationships provide investigation context; they do not establish a single campaign on their own. Risk remains a prioritisation heuristic, not a probability.", "",
         "## 5. Data limitations and analyst validation", "",
         "- CICIDS2017 is a labelled benchmark dataset, not live SOC telemetry. Ground-truth Label is excluded from alert selection and all investigation stages; use it separately for offline evaluation only.",
         "- Behaviour rules use fixed time buckets and can miss activity spanning bucket boundaries. Streaming deployment requires stateful rolling windows.",
@@ -1758,15 +1764,18 @@ def run_soc_investigation_from_events(
             "review_only_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("review_only_flows", 0),
             "context_signal_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("context_signal_flows", 0),
         },
-        "artifacts": [
-            "review_candidates_with_metadata.csv",
-            "attack_events.csv",
-            "event_correlations.csv",
-            "attack_graph.gexf",
-            "incident_investigation.csv",
-            "incident_investigation.json",
-            "incident_investigation_report.md",
-        ],
+        "artifacts": (
+            (["review_candidates_with_metadata.csv"]
+             if (out / "review_candidates_with_metadata.csv").exists() else [])
+            + [
+                "attack_events.csv",
+                "event_correlations.csv",
+                "attack_graph.gexf",
+                "incident_investigation.csv",
+                "incident_investigation.json",
+                "incident_investigation_report.md",
+            ]
+        ),
         "ground_truth_labels_used_for_investigation": False,
     }
     (out / "soc_pipeline_manifest.json").write_text(
