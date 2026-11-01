@@ -471,255 +471,27 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
         random_state=42,
         n_jobs=-1,
     )
-    model.fit(X_train_benign_sample)
+    model.fit(x.iloc[train_benign_idx])
+    model_training_sample = len(train_benign_idx)
 
-    val_scores = model.decision_function(X_val)
-    test_scores = model.decision_function(X_test)
+    # The exact notebook verifier above remains a separate historical
+    # reproduction. Regardless of whether its Parquet was supplied, the SOC
+    # run trains and calibrates on the metadata pipeline's own split.
+    val_scores = model.decision_function(x.iloc[val_idx])
+    test_scores = model.decision_function(x.iloc[test_idx])
+    validation_benign = y.iloc[val_idx].to_numpy() == 0
+    if not validation_benign.any():
+        raise ValueError("Validation split contains no benign rows for threshold calibration.")
+    # Set a 5% benign validation alert budget. Never optimise this threshold
+    # against attack labels or use the test split for threshold selection.
+    active_threshold = float(np.quantile(val_scores[validation_benign], 0.05))
+    val_metrics = evaluate(y.iloc[val_idx], val_scores, active_threshold)
+    test_metrics = evaluate(y.iloc[test_idx], test_scores, active_threshold)
 
-    val_metrics = evaluate(y_val, val_scores, FINAL_THRESHOLD)
-    test_metrics = evaluate(y_test, test_scores, FINAL_THRESHOLD)
-
-    environment = benchmark_environment_status()
-
-    expected = {
-        "roc_auc": 0.8876,
-        "pr_auc": 0.6843,
-        "precision": 0.6388,
-        "recall": 0.7252,
-        "f1": 0.6792,
-        "fpr": 0.0729,
-    }
-    reproduction_check = {
-        metric: {
-            "actual": float(test_metrics[metric]),
-            "expected_notebook": expected[metric],
-            "absolute_delta": float(abs(test_metrics[metric] - expected[metric])),
-            "matches_4dp": round(test_metrics[metric], 4) == expected[metric],
-        }
-        for metric in expected
-    }
-
-    result = {
-        "dataset_rows": int(len(df)),
-        "feature_count": int(X.shape[1]),
-        "train_rows": int(len(X_train)),
-        "validation_rows": int(len(X_val)),
-        "test_rows": int(len(X_test)),
-        "benign_training_sample": int(len(X_train_benign_sample)),
-        "n_estimators": FINAL_N_ESTIMATORS,
-        "max_samples": FINAL_MAX_SAMPLES,
-        "max_features": FINAL_MAX_FEATURES,
-        "contamination": "auto",
-        "random_state": 42,
-        "active_anomaly_threshold": float(active_threshold),
-        "threshold_calibration": (
-            "historical fixed benchmark threshold"
-            if benchmark_parquet
-            else "5th percentile of held-out benign validation scores"
-        ),
-        "historical_benchmark_threshold": FINAL_THRESHOLD,
-        "environment": environment,
-        "validation": val_metrics,
-        "test": test_metrics,
-        "reproduction_check_against_notebook_output": reproduction_check,
-        "exact_4dp_reproduction": (
-            environment["matches"]
-            and all(item["matches_4dp"] for item in reproduction_check.values())
-        ),
-    }
-
-    (out / "exact_benchmark_reproduction.json").write_text(
-        json.dumps(result, indent=2),
-        encoding="utf-8",
-    )
-
-    print("\nEXACT BENCHMARK REPRODUCTION")
-    print("=" * 60)
-    print(f"Rows                : {len(df):,}")
-    print(f"Features            : {X.shape[1]}")
-    print(f"Train / Val / Test  : {len(X_train):,} / {len(X_val):,} / {len(X_test):,}")
-    print(f"Benign train sample : {len(X_train_benign_sample):,}")
-    print(f"Threshold           : {FINAL_THRESHOLD:.6f}")
-    print(
-        "Environment         :",
-        "MATCH" if environment["matches"] else "MISMATCH",
-    )
-    if not environment["matches"]:
-        for package, detail in environment["mismatches"].items():
-            print(
-                f"  {package}: installed={detail['installed']!r}, "
-                f"expected={detail['expected']!r}"
-            )
-    print(f"ROC-AUC             : {test_metrics['roc_auc']:.4f}")
-    print(f"PR-AUC              : {test_metrics['pr_auc']:.4f}")
-    print(f"Precision           : {test_metrics['precision']:.4f}")
-    print(f"Recall              : {test_metrics['recall']:.4f}")
-    print(f"F1                  : {test_metrics['f1']:.4f}")
-    print(f"FPR                 : {test_metrics['fpr']:.4f}")
-    if environment["matches"]:
-        comparison_status = (
-            "EXACT"
-            if result["exact_4dp_reproduction"]
-            else "NUMERIC_MISMATCH"
-        )
-    else:
-        comparison_status = "REFERENCE_ONLY_RUNTIME_DIFFERENCE"
-
-    result["comparison_status"] = comparison_status
-
-    print(
-        "Benchmark comparison:",
-        comparison_status,
-    )
-
-    return result
-
-
-def run(
-    data_dir: str,
-    output_dir: str,
-    benchmark_parquet: str | None = None,
-    verify_only: bool = False,
-) -> None:
-    start = time.time()
-
-    if benchmark_parquet:
-        exact_result = reproduce_exact_benchmark(
-            benchmark_parquet,
-            str(Path(output_dir) / "benchmark_verification"),
-        )
-        print(
-            "\nBenchmark verification status:",
-            "EXACT" if exact_result["exact_4dp_reproduction"] else "MISMATCH",
-        )
-        if verify_only:
-            return
-    data_path = Path(data_dir)
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    df, x = exact_preprocess(load_metadata_dataset(data_path))
-
-    print(f"Cleaned metadata-preserving rows: {len(df):,}")
-    print(f"Benchmark features: {x.shape[1]}")
-
-    indices = np.arange(len(df))
-    y = df["is_attack"]
-
-    train_idx, temp_idx = train_test_split(
-        indices,
-        test_size=0.30,
-        random_state=42,
-        stratify=y,
-    )
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=0.50,
-        random_state=42,
-        stratify=y.iloc[temp_idx],
-    )
-
-    train_attack = y.iloc[train_idx]
-    train_benign_frame = pd.DataFrame({
-        "_row_idx": train_idx,
-        "_is_attack": train_attack.to_numpy(),
-    })
-    train_benign_frame = train_benign_frame[train_benign_frame["_is_attack"] == 0]
-
-    # Match isolation_forest.ipynb exactly: pandas.DataFrame.sample(...,
-    # random_state=42), not numpy choice.
-    if len(train_benign_frame) > MAX_TRAIN_SAMPLES:
-        train_benign_frame = train_benign_frame.sample(
-            n=MAX_TRAIN_SAMPLES,
-            random_state=42,
-        )
-    train_benign_idx = train_benign_frame["_row_idx"].to_numpy()
-
-    # Leakage-safe metadata preprocessing: fit imputation statistics only on
-    # training rows and reuse them for validation, test and inference rows.
-    train_medians = x.iloc[train_idx].median(numeric_only=True)
-    train_medians = train_medians.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    x = x.fillna(train_medians).fillna(0.0)
-    for feature in BENCHMARK_FEATURES:
-        df[feature] = x[feature]
-
-    print(f"Train rows     : {len(train_idx):,}")
-    print(f"Validation rows: {len(val_idx):,}")
-    print(f"Test rows      : {len(test_idx):,}")
-    print(f"Benign IF train: {len(train_benign_idx):,}")
-
-    model = IsolationForest(
-        n_estimators=FINAL_N_ESTIMATORS,
-        max_samples=FINAL_MAX_SAMPLES,
-        max_features=FINAL_MAX_FEATURES,
-        contamination="auto",
-        random_state=42,
-        n_jobs=-1,
-    )
-    if benchmark_parquet:
-        # Retrain here from the same exact Parquet sample after applying the
-        # same feature-matrix cleanup used by isolation_forest.ipynb.
-        benchmark_df = pd.read_parquet(benchmark_parquet)
-        benchmark_X = benchmark_df.drop(columns=["Label"]).copy()
-        benchmark_y = (
-            benchmark_df["Label"].astype(str).str.strip() != "Benign"
-        ).astype(int)
-        benchmark_feature_names = [str(c).strip().lower() for c in benchmark_X.columns]
-        if benchmark_feature_names != BENCHMARK_FEATURES:
-            missing = [c for c in BENCHMARK_FEATURES if c not in benchmark_feature_names]
-            extra = [c for c in benchmark_feature_names if c not in BENCHMARK_FEATURES]
-            raise ValueError(
-                "Benchmark Parquet feature order/set does not match the expected "
-                f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
-            )
-        benchmark_X.columns = benchmark_feature_names
-        benchmark_X = benchmark_X.replace([np.inf, -np.inf], np.nan)
-        if benchmark_X.isna().sum().sum() > 0:
-            benchmark_X = benchmark_X.fillna(
-                benchmark_X.median(numeric_only=True)
-            )
-        constant_cols = benchmark_X.columns[benchmark_X.nunique() <= 1].tolist()
-        if constant_cols:
-            benchmark_X = benchmark_X.drop(columns=constant_cols)
-        X_train, _, y_train, _ = train_test_split(
-            benchmark_X,
-            benchmark_y,
-            test_size=0.30,
-            random_state=42,
-            stratify=benchmark_y,
-        )
-        X_train_benign = X_train[y_train == 0]
-        X_train_benign_sample = X_train_benign.sample(
-            n=MAX_TRAIN_SAMPLES,
-            random_state=42,
-        )
-        model.fit(X_train_benign_sample)
-        model_training_sample = len(X_train_benign_sample)
-    else:
-        model.fit(x.iloc[train_benign_idx])
-
-    if benchmark_parquet:
-        # Retain the historical benchmark threshold only for runs explicitly
-        # tied to the reference Parquet verification path.
-        val_metrics = None
-        test_metrics = exact_result["test"]
-        active_threshold = FINAL_THRESHOLD
-    else:
-        val_scores = model.decision_function(x.iloc[val_idx])
-        test_scores = model.decision_function(x.iloc[test_idx])
-        validation_benign = y.iloc[val_idx].to_numpy() == 0
-        if not validation_benign.any():
-            raise ValueError("Validation split contains no benign rows for threshold calibration.")
-        # Calibrate to a 5% validation-benign alert budget. Do not optimise
-        # threshold on validation F1 or inspect held-out test labels.
-        active_threshold = float(np.quantile(val_scores[validation_benign], 0.05))
-        val_metrics = evaluate(y.iloc[val_idx], val_scores, active_threshold)
-        test_metrics = evaluate(y.iloc[test_idx], test_scores, active_threshold)
-
-        print("\nVALIDATION (5% benign-tail threshold calibration)")
-        print(json.dumps(val_metrics, indent=2))
-        print("\nHELD-OUT TEST")
-        print(json.dumps(test_metrics, indent=2))
+    print("\nVALIDATION (5% benign-tail threshold calibration)")
+    print(json.dumps(val_metrics, indent=2))
+    print("\nHELD-OUT TEST")
+    print(json.dumps(test_metrics, indent=2))
 
     # Isolation Forest is one detector in a broader alert pipeline.
     all_scores = model.decision_function(x)
