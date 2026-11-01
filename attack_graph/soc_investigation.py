@@ -424,9 +424,44 @@ class GraphAnalystAgent:
                 "gap_seconds": attrs.get("gap_seconds"),
                 "pivot_host": attrs.get("pivot_host"),
             })
+        component_graph = self.event_graph.subgraph(component).copy()
+        relation_counts: dict[str, int] = {}
+        for _, _, attrs in component_graph.edges(data=True):
+            for relation in str(attrs.get("relations", attrs.get("relation", ""))).split("|"):
+                if relation:
+                    relation_counts[relation] = relation_counts.get(relation, 0) + 1
+        degree_values = nx.degree_centrality(component_graph) if component_graph.number_of_nodes() > 1 else {
+            node: 0.0 for node in component_graph.nodes()
+        }
+        if component_graph.number_of_nodes() > 2:
+            betweenness_values = nx.betweenness_centrality(
+                component_graph,
+                k=min(100, component_graph.number_of_nodes()),
+                seed=42,
+            )
+        else:
+            betweenness_values = {node: 0.0 for node in component_graph.nodes()}
+        top_central_events = [
+            {
+                "event_id": node.removeprefix("event:"),
+                "degree_centrality": round(float(degree_values.get(node, 0.0)), 4),
+                "betweenness_centrality": round(float(betweenness_values.get(node, 0.0)), 4),
+            }
+            for node in sorted(
+                component_graph.nodes(),
+                key=lambda item: (
+                    -degree_values.get(item, 0.0),
+                    -betweenness_values.get(item, 0.0),
+                    item,
+                ),
+            )[:5]
+        ]
         return {
             "event_count": int(len(rows)),
-            "graph_event_links": int(self.event_graph.subgraph(component).number_of_edges()),
+            "graph_event_links": int(component_graph.number_of_edges()),
+            "graph_density": round(float(nx.density(component_graph)), 4) if component_graph.number_of_nodes() > 1 else 0.0,
+            "edge_relation_counts": dict(sorted(relation_counts.items())),
+            "top_central_events": top_central_events,
             "unique_sources": int(rows["src_ip"].nunique()),
             "unique_targets": int(rows["dst_ip"].nunique()),
             "unique_services": len(dst_ports),
@@ -481,35 +516,80 @@ class ThreatHuntingAgent:
 
 
 class IncidentTriageAgent:
-    """Rank incidents with transparent evidence components, not attack-type weights."""
+    """Rank incidents with inspectable evidence-derived priority components."""
+
     @staticmethod
-    def score(rows: pd.DataFrame, graph_data: dict[str, Any],
-              hypotheses: list[dict[str, str]], anomaly_strength: float | None) -> dict[str, Any]:
+    def score(
+        rows: pd.DataFrame,
+        graph_data: dict[str, Any],
+        hypotheses: list[dict[str, str]],
+        anomaly_strength: float | None,
+    ) -> dict[str, Any]:
         reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
         behavioural = reasons - {"ISOLATION_FOREST_ANOMALY", "ANOMALY"}
-        parts = [
-            (30.0, min(1.0, len(behavioural) / 3.0)),
-            (20.0, min(1.0, math.log1p(len(rows)) / math.log1p(10))),
-            (20.0, min(1.0, graph_data["max_source_fanout"] / 20.0)),
-            (15.0, min(1.0, graph_data["max_target_fanin"] / 20.0)),
-            (10.0, min(1.0, graph_data["unique_services"] / 20.0)),
-        ]
-        if anomaly_strength is not None:
-            parts.append((5.0, max(0.0, min(1.0, anomaly_strength))))
-        risk = round(100.0 * sum(weight * score for weight, score in parts) / sum(weight for weight, _ in parts), 1)
-        severity = "CRITICAL" if risk >= 80 else "HIGH" if risk >= 60 else "MEDIUM" if risk >= 35 else "LOW"
-        signals = int(bool(behavioural))
-        signals += int(graph_data["graph_event_links"] > 0 or bool(graph_data["pivot_hosts"]))
-        signals += int(anomaly_strength is not None)
-        signals += int(len(hypotheses) > 1)
-        confidence = "HIGH" if signals >= 3 and len(rows) >= 4 else "MEDIUM" if signals >= 2 or len(rows) >= 3 else "LOW"
-        return {
-            "risk_score": risk, "severity": severity, "confidence": confidence,
-            "independent_signal_count": signals,
-            "scoring_note": "Heuristic triage priority, not a calibrated probability of compromise.",
+        components = {
+            "behavioural_rule_diversity": min(1.0, len(behavioural) / 3.0),
+            "event_persistence": min(
+                1.0,
+                math.log1p(len(rows)) / math.log1p(10),
+            ),
+            "source_fanout": min(1.0, graph_data["max_source_fanout"] / 20.0),
+            "destination_convergence": min(1.0, graph_data["max_target_fanin"] / 20.0),
+            "service_diversity": min(1.0, graph_data["unique_services"] / 20.0),
         }
+        weights = {
+            "behavioural_rule_diversity": 30.0,
+            "event_persistence": 20.0,
+            "source_fanout": 20.0,
+            "destination_convergence": 15.0,
+            "service_diversity": 10.0,
+        }
+        if anomaly_strength is not None:
+            components["isolation_forest_support"] = max(
+                0.0, min(1.0, float(anomaly_strength))
+            )
+            weights["isolation_forest_support"] = 5.0
 
+        total_weight = sum(weights.values())
+        contributions = {
+            name: round(weights[name] * components[name] / total_weight * 100.0, 2)
+            for name in components
+        }
+        risk = round(sum(contributions.values()), 1)
+        severity = (
+            "CRITICAL" if risk >= 80
+            else "HIGH" if risk >= 60
+            else "MEDIUM" if risk >= 35
+            else "LOW"
+        )
 
+        signal_count = int(bool(behavioural))
+        signal_count += int(graph_data["graph_event_links"] > 0 or bool(graph_data["pivot_hosts"]))
+        signal_count += int(anomaly_strength is not None)
+        signal_count += int(len(hypotheses) > 1)
+        confidence = (
+            "HIGH" if signal_count >= 3 and len(rows) >= 4
+            else "MEDIUM" if signal_count >= 2 or len(rows) >= 3
+            else "LOW"
+        )
+        return {
+            "risk_score": risk,
+            "severity": severity,
+            "confidence": confidence,
+            "independent_signal_count": signal_count,
+            "components": {
+                name: {
+                    "normalised_value": round(float(components[name]), 4),
+                    "weight_pct": weights[name],
+                    "contribution_points": contributions[name],
+                }
+                for name in components
+            },
+            "scoring_note": (
+                "Heuristic SOC triage priority, not a calibrated probability "
+                "of compromise. Tune weights against analyst-labelled incidents."
+            ),
+        }
 
 
 class IncidentFormationAgent:
