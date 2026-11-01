@@ -74,7 +74,7 @@ The alert-selection and investigation path does not use ground-truth labels. Lab
 
 ## Ollama / local LLM
 
-This work does not change Ollama, its model, server, prompts, latency or runtime configuration. The structured incident JSON is the evidence source for an existing local-LLM narrative layer. The LLM should explain those findings; it should not invent entities, attack chains, severity or ATT&CK mappings absent from the evidence JSON.
+No Ollama integration is present in the tracked source files of this GitHub repository, so this change does not add, configure or alter Ollama, its model, server, prompts or latency. The structured incident JSON is ready to be consumed by a separate local-LLM layer if you have one in your local workspace. The LLM should explain those findings; it should not invent entities, attack chains, severity or ATT&CK mappings absent from the evidence JSON.
 
 Important scope distinction: the graph analyst, threat-hunting and triage stages in this branch are deterministic, role-separated analysis modules. They form an auditable investigation workflow, not a claim that autonomous tool-using LLM agents are already implemented.
 
