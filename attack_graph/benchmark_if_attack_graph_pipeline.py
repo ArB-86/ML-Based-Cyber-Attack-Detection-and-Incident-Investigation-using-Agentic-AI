@@ -462,6 +462,7 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
         random_state=42,
     )
 
+    model_training_sample = len(train_benign_idx)
     model = IsolationForest(
         n_estimators=FINAL_N_ESTIMATORS,
         max_samples=FINAL_MAX_SAMPLES,
@@ -510,7 +511,13 @@ def reproduce_exact_benchmark(parquet_path: str, output_dir: str) -> dict:
         "max_features": FINAL_MAX_FEATURES,
         "contamination": "auto",
         "random_state": 42,
-        "benchmark_threshold": FINAL_THRESHOLD,
+        "active_anomaly_threshold": float(active_threshold),
+        "threshold_calibration": (
+            "historical fixed benchmark threshold"
+            if benchmark_parquet
+            else "5th percentile of held-out benign validation scores"
+        ),
+        "historical_benchmark_threshold": FINAL_THRESHOLD,
         "environment": environment,
         "validation": val_metrics,
         "test": test_metrics,
@@ -687,6 +694,7 @@ def run(
             random_state=42,
         )
         model.fit(X_train_benign_sample)
+        model_training_sample = len(X_train_benign_sample)
     else:
         model.fit(x.iloc[train_benign_idx])
 
@@ -802,7 +810,7 @@ def run(
         "train_rows": int(len(train_idx)),
         "validation_rows": int(len(val_idx)),
         "test_rows": int(len(test_idx)),
-        "benign_training_sample": int(len(train_benign_idx)),
+        "model_training_sample": int(model_training_sample),
         "n_estimators": FINAL_N_ESTIMATORS,
         "max_samples": FINAL_MAX_SAMPLES,
         "max_features": FINAL_MAX_FEATURES,
