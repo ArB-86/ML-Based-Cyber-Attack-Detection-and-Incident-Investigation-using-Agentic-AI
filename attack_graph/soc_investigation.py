@@ -524,14 +524,33 @@ class GraphAnalystAgent:
         }
 
 
+
 class ThreatHuntingAgent:
-    """Map only observable behaviours to ATT&CK candidate techniques."""
+    """Map only event-specific, observable behaviours to ATT&CK candidate techniques."""
+
+    REMOTE_SERVICE_PORTS = {22, 445, 3389, 5985, 5986, 5900}
+
     @staticmethod
-    def analyse(rows: pd.DataFrame, graph_data: dict[str, Any]) -> list[dict[str, str]]:
+    def _port_values(value: Any) -> set[int]:
+        if isinstance(value, str):
+            try:
+                import ast
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                value = []
+        if not isinstance(value, (list, tuple, set)):
+            return set()
+        return {
+            int(port) for port in value
+            if str(port).isdigit() and 0 <= int(port) <= 65535
+        }
+
+    @staticmethod
+    def analyse(rows: pd.DataFrame, graph_data: dict[str, Any]) -> list[dict[str, Any]]:
         detection_reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
         review_reasons = _tokens(rows.get("review_reasons", pd.Series(dtype=object)))
         reasons = detection_reasons | review_reasons
-        hypotheses = []
+        hypotheses: list[dict[str, Any]] = []
         event_ids = rows["event_id"].astype(str)
         review_by_event = rows.get(
             "review_reasons", pd.Series("", index=rows.index)
@@ -539,60 +558,141 @@ class ThreatHuntingAgent:
         brute_by_event = rows.get(
             "detection_reasons", pd.Series("", index=rows.index)
         ).fillna("").astype(str)
-        scan_ids = event_ids[
-            review_by_event.str.contains(r"(?:^|;)PORT_SCAN(?:;|$)", regex=True)
-        ].tolist()
-        brute_ids = event_ids[
-            brute_by_event.str.contains("BRUTE_FORCE_PATTERN", regex=False)
-        ].tolist()
-        pivot_ids = sorted({
-            event_id
-            for edge in graph_data["chain_edges"]
-            if "host_pivot" in edge["relation"]
-            for event_id in (edge["from_event"], edge["to_event"])
-        })
+
+        scan_ids = sorted(event_ids[
+            review_by_event.str.contains(
+                r"(?:^|;)PORT_SCAN(?:;|$)", regex=True
+            )
+        ].tolist())
+        brute_ids = sorted(event_ids[
+            brute_by_event.str.contains(
+                r"(?:^|;)BRUTE_FORCE_PATTERN(?:;|$)", regex=True
+            )
+        ].tolist())
+
         if "PORT_SCAN" in review_reasons:
             hypotheses.append({
-                "technique_id": "T1046", "technique": "Network Service Discovery",
+                "technique_id": "T1046",
+                "technique": "Network Service Discovery",
                 "confidence": "low",
-                "evidence": "A source-to-destination flow pattern matched the secondary port-scan review heuristic.",
+                "evidence": (
+                    "One or more event-specific source/destination flow patterns "
+                    "matched the secondary port-scan review heuristic."
+                ),
                 "evidence_event_ids": scan_ids,
-                "caveat": "This rule is not an actionable detection by itself; validate scanner authorization and corroborate with firewall/IDS telemetry.",
+                "caveat": (
+                    "This is a review-only lead, not an actionable detection. "
+                    "Validate scanner authorization and corroborate with firewall/IDS telemetry."
+                ),
             })
-        # The former DDoS heuristic and raw destination convergence remain
-        # contextual telemetry only; flow metadata alone cannot establish
-        # service impact or malicious intent. Do not map them to T1498.
-        if "BRUTE_FORCE_PATTERN" in reasons:
+
+        if "BRUTE_FORCE_PATTERN" in detection_reasons:
             hypotheses.append({
-                "technique_id": "T1110", "technique": "Brute Force",
+                "technique_id": "T1110",
+                "technique": "Brute Force",
                 "confidence": "medium",
-                "evidence": "Repeated flows targeted an authentication service from one source to one destination.",
+                "evidence": (
+                    "Event records matched the high-specificity repeated-flow "
+                    "authentication-service heuristic."
+                ),
                 "evidence_event_ids": brute_ids,
-                "caveat": "Authentication success/failure logs are required to confirm credential guessing.",
+                "caveat": (
+                    "Network flows do not reveal authentication outcomes. "
+                    "Authentication success/failure logs are required to confirm credential guessing."
+                ),
             })
-        if graph_data["pivot_hosts"] and {22, 445, 3389, 5985, 5986, 5900}.intersection(graph_data["destination_ports"]):
+
+        # A remote-services hypothesis requires the same exact directed pivot
+        # edge to contain an inbound event to the pivot host on a remote-service
+        # port, followed by an event initiated by that pivot host. Merely having
+        # a pivot somewhere and a remote port elsewhere in the incident is not enough.
+        event_lookup = {
+            str(row["event_id"]): row
+            for _, row in rows.iterrows()
+        }
+        pivot_evidence_ids: set[str] = set()
+        pivot_evidence_edges: list[dict[str, Any]] = []
+        for edge in graph_data.get("chain_edges", []):
+            if "host_pivot" not in str(edge.get("relation", "")):
+                continue
+            previous_id = str(edge.get("from_event", ""))
+            current_id = str(edge.get("to_event", ""))
+            previous = event_lookup.get(previous_id)
+            current = event_lookup.get(current_id)
+            if previous is None or current is None:
+                continue
+            pivot_host = str(edge.get("pivot_host") or "")
+            if (
+                not pivot_host
+                or str(previous.get("dst_ip")) != pivot_host
+                or str(current.get("src_ip")) != pivot_host
+            ):
+                continue
+            inbound_ports = ThreatHuntingAgent._port_values(
+                previous.get("dst_ports", [])
+            )
+            matching_ports = sorted(
+                inbound_ports & ThreatHuntingAgent.REMOTE_SERVICE_PORTS
+            )
+            if not matching_ports:
+                continue
+            pivot_evidence_ids.update({previous_id, current_id})
+            pivot_evidence_edges.append({
+                "from_event": previous_id,
+                "to_event": current_id,
+                "pivot_host": pivot_host,
+                "remote_service_ports": matching_ports,
+                "gap_seconds": edge.get("gap_seconds"),
+            })
+
+        if pivot_evidence_edges:
             hypotheses.append({
-                "technique_id": "T1021", "technique": "Remote Services",
+                "technique_id": "T1021",
+                "technique": "Remote Services",
                 "confidence": "low",
-                "evidence": "A host was targeted and later initiated another related flow involving a remote-access port.",
-                "evidence_event_ids": pivot_ids,
-                "caveat": "A pivot is an investigation lead, not proof of lateral movement.",
+                "evidence": (
+                    "An inbound event to a pivot host targeted a remote-service port, "
+                    "followed by an outbound event initiated by that same host."
+                ),
+                "evidence_event_ids": sorted(pivot_evidence_ids),
+                "evidence_edges": sorted(
+                    pivot_evidence_edges,
+                    key=lambda item: (item["from_event"], item["to_event"]),
+                ),
+                "caveat": (
+                    "This directed network-flow sequence is an investigation lead, "
+                    "not proof of authenticated lateral movement or successful remote access."
+                ),
             })
         return hypotheses
 
 
+
 class IncidentTriageAgent:
-    """Rank incidents with inspectable evidence-derived priority components."""
+    """Rank analyst workload separately from confidence in compromise."""
+
+    EXTERNAL_EVIDENCE_COLUMNS = (
+        "external_evidence_sources",
+        "independent_telemetry_sources",
+        "corroboration_sources",
+    )
 
     @staticmethod
     def score(
         rows: pd.DataFrame,
         graph_data: dict[str, Any],
-        hypotheses: list[dict[str, str]],
+        hypotheses: list[dict[str, Any]],
         anomaly_strength: float | None,
     ) -> dict[str, Any]:
         reasons = _tokens(rows.get("detection_reasons", pd.Series(dtype=object)))
+        review_reasons = _tokens(rows.get("review_reasons", pd.Series(dtype=object)))
         behavioural = reasons - {"ISOLATION_FOREST_ANOMALY", "ANOMALY"}
+
+        external_sources: set[str] = set()
+        for column in IncidentTriageAgent.EXTERNAL_EVIDENCE_COLUMNS:
+            if column in rows.columns:
+                external_sources.update(_tokens(rows[column]))
+
         components = {
             "behavioural_rule_diversity": min(1.0, len(behavioural) / 3.0),
             "event_persistence": min(
@@ -618,31 +718,61 @@ class IncidentTriageAgent:
 
         total_weight = sum(weights.values())
         contributions = {
-            name: round(weights[name] * components[name] / total_weight * 100.0, 2)
+            name: round(
+                weights[name] * components[name] / total_weight * 100.0, 2
+            )
             for name in components
         }
-        risk = round(sum(contributions.values()), 1)
-        severity = (
-            "CRITICAL" if risk >= 80
-            else "HIGH" if risk >= 60
-            else "MEDIUM" if risk >= 35
-            else "LOW"
-        )
+        # This is an analyst-priority score, not attack probability or asset impact.
+        priority_score = round(sum(contributions.values()), 1)
 
-        signal_count = int(bool(behavioural))
-        signal_count += int(graph_data["graph_event_links"] > 0 or bool(graph_data["pivot_hosts"]))
-        signal_count += int(anomaly_strength is not None)
-        signal_count += int(len(hypotheses) > 1)
-        confidence = (
-            "HIGH" if signal_count >= 3 and len(rows) >= 4
-            else "MEDIUM" if signal_count >= 2 or len(rows) >= 3
-            else "LOW"
-        )
+        has_actionable_flow_signal = "BRUTE_FORCE_PATTERN" in reasons
+        has_review_only_signal = "PORT_SCAN" in review_reasons
+        external_source_count = len(external_sources)
+
+        # Network-flow-only evidence cannot independently establish compromise.
+        # HIGH confidence requires at least two distinct out-of-band telemetry
+        # categories; currently the CICIDS flow-only replay supplies none.
+        if external_source_count >= 2:
+            confidence = "HIGH"
+            confidence_basis = (
+                "At least two distinct out-of-band telemetry categories are recorded."
+            )
+            severity = (
+                "CRITICAL" if priority_score >= 85
+                else "HIGH" if priority_score >= 60
+                else "MEDIUM" if priority_score >= 35
+                else "LOW"
+            )
+        elif has_actionable_flow_signal:
+            confidence = "MEDIUM"
+            confidence_basis = (
+                "A high-specificity network-flow behaviour is present, but independent "
+                "authentication/endpoint corroboration is unavailable."
+            )
+            severity = "MEDIUM" if priority_score >= 35 else "LOW"
+        elif has_review_only_signal:
+            confidence = "LOW"
+            confidence_basis = (
+                "Only a review-tier network heuristic is present; corroboration is absent."
+            )
+            severity = "MEDIUM" if priority_score >= 60 else "LOW"
+        else:
+            confidence = "LOW"
+            confidence_basis = (
+                "Evidence consists of network-flow anomaly/context signals without "
+                "independent out-of-band corroboration."
+            )
+            severity = "MEDIUM" if priority_score >= 60 else "LOW"
+
         return {
-            "risk_score": risk,
+            "risk_score": priority_score,  # Retained for report/API compatibility.
+            "priority_score": priority_score,
             "severity": severity,
             "confidence": confidence,
-            "independent_signal_count": signal_count,
+            "independent_signal_count": external_source_count,
+            "external_corroboration_sources": sorted(external_sources),
+            "confidence_basis": confidence_basis,
             "components": {
                 name: {
                     "normalised_value": round(float(components[name]), 4),
@@ -652,38 +782,166 @@ class IncidentTriageAgent:
                 for name in components
             },
             "scoring_note": (
-                "Heuristic SOC triage priority, not a calibrated probability "
-                "of compromise. Tune weights against analyst-labelled incidents."
+                "Priority score is a heuristic analyst-workload ranking, not a calibrated "
+                "probability of compromise. Severity is provisional. Without at least two "
+                "distinct out-of-band telemetry categories, severity is capped at MEDIUM "
+                "and confidence cannot be HIGH."
             ),
         }
 
 
-class IncidentFormationAgent:
-    """Form candidate incidents from the explicit event-correlation table."""
 
-    def __init__(self, events: pd.DataFrame, correlations: pd.DataFrame):
-        self.events = events
-        self.correlations = correlations
+class IncidentFormationAgent:
+    """Form bounded candidate incidents from higher-specificity correlation edges.
+
+    Same-target and same-service relationships remain available in the graph for
+    context, but are deliberately excluded from incident membership. Same-source
+    and directional host-pivot relationships may join events only within their
+    relation-specific gap limits and a bounded campaign time span.
+    """
+
+    def __init__(
+        self,
+        events: pd.DataFrame,
+        correlations: pd.DataFrame,
+        *,
+        max_campaign_duration_seconds: int = 900,
+        same_source_max_gap_seconds: int = 60,
+        host_pivot_max_gap_seconds: int = 120,
+        min_events: int = 2,
+    ):
+        if max_campaign_duration_seconds < 0:
+            raise ValueError("max_campaign_duration_seconds must be non-negative.")
+        if same_source_max_gap_seconds < 0 or host_pivot_max_gap_seconds < 0:
+            raise ValueError("Incident-forming relation gap limits must be non-negative.")
+        if min_events < 2:
+            raise ValueError("min_events must be at least 2.")
+        self.events = events.copy()
+        self.correlations = correlations.copy()
+        self.max_campaign_duration_seconds = int(max_campaign_duration_seconds)
+        self.relation_gap_limits = {
+            "same_source_temporal": int(same_source_max_gap_seconds),
+            "host_pivot": int(host_pivot_max_gap_seconds),
+        }
+        self.min_events = int(min_events)
 
     def form(self) -> list[tuple[pd.Timestamp, set[str], pd.DataFrame]]:
-        event_nodes = {f"event:{event_id}" for event_id in self.events["event_id"].astype(str)}
-        correlated = nx.Graph()
-        correlated.add_nodes_from(event_nodes)
-        known_ids = {node.removeprefix("event:") for node in event_nodes}
-        for _, edge in self.correlations.iterrows():
-            source_id, target_id = str(edge["from_event"]), str(edge["to_event"])
-            if source_id not in known_ids or target_id not in known_ids:
+        if self.events.empty:
+            return []
+        required = {"event_id", "start_time", "end_time"}
+        missing = required - set(self.events.columns)
+        if missing:
+            raise ValueError(f"Incident formation is missing columns: {sorted(missing)}")
+
+        work = self.events.copy()
+        for column in ("start_time", "end_time"):
+            work[column] = pd.to_datetime(
+                work[column], errors="coerce", utc=True, format="mixed"
+            )
+        if work[["start_time", "end_time"]].isna().any().any():
+            raise ValueError("Incident formation requires valid event timestamps.")
+        ids = work["event_id"].astype(str).tolist()
+        if any(not event_id for event_id in ids) or len(ids) != len(set(ids)):
+            raise ValueError("Incident formation requires non-empty, unique event IDs.")
+
+        parent = {event_id: event_id for event_id in ids}
+        sizes = {event_id: 1 for event_id in ids}
+        starts = {
+            str(row["event_id"]): row["start_time"]
+            for _, row in work.iterrows()
+        }
+        ends = {
+            str(row["event_id"]): row["end_time"]
+            for _, row in work.iterrows()
+        }
+        component_min = dict(starts)
+        component_max = dict(ends)
+
+        def find(event_id: str) -> str:
+            while parent[event_id] != event_id:
+                parent[event_id] = parent[parent[event_id]]
+                event_id = parent[event_id]
+            return event_id
+
+        def union(first_id: str, second_id: str) -> None:
+            first_root, second_root = find(first_id), find(second_id)
+            if first_root == second_root:
+                return
+            if sizes[first_root] < sizes[second_root]:
+                first_root, second_root = second_root, first_root
+            parent[second_root] = first_root
+            sizes[first_root] += sizes[second_root]
+            component_min[first_root] = min(
+                component_min[first_root], component_min[second_root]
+            )
+            component_max[first_root] = max(
+                component_max[first_root], component_max[second_root]
+            )
+
+        eligible_edges: list[tuple[pd.Timestamp, str, str, str]] = []
+        for edge in self.correlations.to_dict("records"):
+            source_id, target_id = str(edge.get("from_event", "")), str(edge.get("to_event", ""))
+            if source_id not in parent or target_id not in parent:
                 raise ValueError(
                     f"Incident formation received an unknown event link: {source_id} -> {target_id}"
                 )
-            correlated.add_edge(f"event:{source_id}", f"event:{target_id}", **edge.to_dict())
+            relation = str(edge.get("relation", "")).strip()
+            if relation not in self.relation_gap_limits:
+                continue
+            try:
+                gap = float(edge.get("gap_seconds"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(gap) or gap < 0:
+                continue
+            if gap > self.relation_gap_limits[relation]:
+                continue
+            edge_time = max(starts[source_id], starts[target_id])
+            eligible_edges.append((edge_time, relation, source_id, target_id))
+
+        # Deterministic processing makes component boundaries reproducible.
+        eligible_edges.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        for _, _, source_id, target_id in eligible_edges:
+            first_root, second_root = find(source_id), find(target_id)
+            if first_root == second_root:
+                continue
+            merged_start = min(
+                component_min[first_root], component_min[second_root]
+            )
+            merged_end = max(
+                component_max[first_root], component_max[second_root]
+            )
+            merged_span = (merged_end - merged_start).total_seconds()
+            if merged_span > self.max_campaign_duration_seconds:
+                continue
+            union(source_id, target_id)
+
+        grouped_ids: dict[str, set[str]] = {}
+        for event_id in ids:
+            grouped_ids.setdefault(find(event_id), set()).add(event_id)
 
         components = []
-        for component in nx.connected_components(correlated):
-            event_ids = {node.removeprefix("event:") for node in component}
-            rows = self.events[self.events["event_id"].astype(str).isin(event_ids)].copy()
-            if not rows.empty:
-                components.append((rows["start_time"].min(), set(component), rows))
+        for event_ids in grouped_ids.values():
+            rows = work[work["event_id"].astype(str).isin(event_ids)].copy()
+            if rows.empty:
+                continue
+
+            # Preserve standalone high-specificity brute-force candidates and
+            # imported legacy investigation records. Do not turn isolated
+            # Isolation Forest anomalies or review-only port scans into incidents.
+            singleton_keep_reasons = {"BRUTE_FORCE_PATTERN", "LEGACY_EVENT_IMPORT"}
+            keep_singleton = False
+            if len(rows) == 1:
+                reasons = _tokens(rows.get(
+                    "detection_reasons", pd.Series("", index=rows.index)
+                ))
+                keep_singleton = bool(reasons & singleton_keep_reasons)
+            if len(rows) < self.min_events and not keep_singleton:
+                continue
+
+            components.append((rows["start_time"].min(), {
+                f"event:{event_id}" for event_id in event_ids
+            }, rows))
         components.sort(key=lambda item: item[0])
         return components
 
@@ -737,10 +995,11 @@ class SOCInvestigationOrchestrator:
             anomaly_strength = None if not values else float(sum(values) / len(values))
             triage = IncidentTriageAgent.score(rows, graph_data, hypotheses, anomaly_strength)
             reasons = sorted(_tokens(rows.get("detection_reasons", pd.Series(dtype=object))))
+            review_reasons = sorted(_tokens(rows.get("review_reasons", pd.Series(dtype=object))))
             start, end = rows["start_time"].min(), rows["end_time"].max()
             incident = {
                 "incident_id": f"INC-{number:05d}",
-                "title": self._title(reasons, graph_data),
+                "title": self._title(reasons, graph_data, review_reasons),
                 "status": "NEEDS_ANALYST_VALIDATION",
                 "start_time": start.isoformat(),
                 "end_time": end.isoformat(),
@@ -748,7 +1007,7 @@ class SOCInvestigationOrchestrator:
                 "event_ids": ids,
                 "total_flows": int(rows["flow_count"].sum()),
                 "detection_reasons": reasons,
-                "review_reasons": sorted(_tokens(rows.get("review_reasons", pd.Series(dtype=object)))),
+                "review_reasons": review_reasons,
                 "context_signals": sorted(_tokens(rows.get("context_signals", pd.Series(dtype=object)))),
                 "graph_analysis": graph_data,
                 "attack_hypotheses": hypotheses,
@@ -791,18 +1050,21 @@ class SOCInvestigationOrchestrator:
         return incidents
 
     @staticmethod
-    def _title(reasons: list[str], graph_data: dict[str, Any]) -> str:
+    def _title(
+        reasons: list[str],
+        graph_data: dict[str, Any],
+        review_reasons: list[str] | None = None,
+    ) -> str:
         r = set(reasons)
-        if "DISTRIBUTED_DOS_PATTERN" in r or graph_data["max_target_fanin"] >= 15:
-            return "Distributed traffic surge against a shared destination"
+        review = set(review_reasons or [])
         if "BRUTE_FORCE_PATTERN" in r:
-            return "Repeated authentication-service activity"
-        if r.intersection({"PORT_SCAN", "HORIZONTAL_SCAN", "HIGH_SOURCE_FANOUT"}):
-            return "Network reconnaissance and service discovery pattern"
-        if graph_data["pivot_hosts"]:
-            return "Multi-stage host-to-host activity chain"
+            return "Repeated authentication-service flow pattern requiring validation"
+        if "PORT_SCAN" in review:
+            return "Port-scan review candidate"
         if "ISOLATION_FOREST_ANOMALY" in r:
-            return "Unusual network-flow activity requiring validation"
+            return "Anomalous network-flow cluster requiring validation"
+        if graph_data["pivot_hosts"]:
+            return "Host-pivot correlation candidate requiring validation"
         return "Correlated network security events"
 
     @staticmethod
