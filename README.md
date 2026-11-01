@@ -18,40 +18,45 @@ python -m attack_graph.benchmark_if_attack_graph_pipeline "D:\MAJOR PROJECT\cici
 
 ## Agentic AI incident investigation
 
-The optional `attack_graph.agentic_investigator` module builds on the existing event table and GEXF graph. It correlates nearby events, retrieves graph-neighborhood evidence, optionally accepts a risk-assessment JSON record, and calls a local Ollama model by default for structured investigation. OpenAI's hosted API is an optional, explicitly selected alternative. The module distinguishes observed evidence from model hypotheses and states limitations rather than treating a dataset label as proof of successful compromise.
+The Agentic Investigation module consumes the existing attack_events.csv and attack_graph.gexf outputs. It does not retrain the detector or rebuild the attack graph. The graph is the primary investigation input; event records provide the evidence behind graph nodes.
 
-Install the optional dependency:
+For a selected event, the module calculates a bounded multi-hop graph neighbourhood, shared-host event relationships, explicit temporal precedes sequences, connected-component membership, attack-type clusters, structural source-to-destination paths, and graph metrics. A local LLM selects from an allowlist of Python investigation tools. The runtime executes those tools, records every call and result, and permits up to two investigation-planning rounds by default before generating the final evidence-grounded SOC report.
+
+The report includes the incident summary, graph findings, reconstructed network sequence when explicit temporal edges exist, involved hosts, hypotheses with evidence, confidence, risk rationale, evidence gaps, defensive next steps, limitations, and the tool-use trace. Graph paths describe structural connectivity and do not prove successful attacker movement or impact.
+
+### Install and local model
+
+Install the optional OpenAI-compatible Python client:
 
 ```powershell
 python -m pip install -r requirements-agentic.txt
 ```
 
-### Free local LLM (recommended)
-
-Install Ollama for Windows from https://ollama.com/download/windows. Then open PowerShell and download a small local model:
+Install Ollama and download the local model:
 
 ```powershell
-ollama pull qwen2.5:3b
+ollama pull qwen2.5:7b
 ollama list
 ```
 
-The model download is about 1.9 GB and requires disk space. Inference runs on your computer without an OpenAI API key or per-token API billing; speed depends on your computer's hardware. Keep Ollama running during investigation.
+Local Ollama mode does not require an OpenAI API key or paid API usage. Inference runs on the local machine; speed depends on its hardware.
 
-Run an offline smoke test with an event ID that actually exists in your events file. To list IDs first, use `python -c "import pandas as pd; print(pd.read_csv('benchmark_graph_output/attack_events.csv')['event_id'].head(10).to_list())"`:
+### Run an investigation
 
-```powershell
-python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --offline --output-dir "agentic_investigation_output"
-```
-
-For a live local LLM investigation, omit `--offline` and use the local Ollama provider:
+Use an event ID that exists in the generated event table:
 
 ```powershell
-python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --provider ollama --output-dir "agentic_investigation_output"
+python -m attack_graph.agentic_investigator "benchmark_graph_output/attack_events.csv" --event-id EVT-00001 --graph "benchmark_graph_output/attack_graph.gexf" --provider ollama --model qwen2.5:7b --output-dir "agentic_investigation_output"
 ```
 
-OpenAI's hosted API is optional and may incur API charges. To choose it explicitly, set `OPENAI_API_KEY` locally (never commit it) and add `--provider openai` to the command.
+The agent performs up to two bounded tool-planning rounds by default. Use --max-tool-rounds 1 for a faster single-round pass, or --max-tool-rounds 3 for a deeper bounded pass. The threshold is read from the adjacent pipeline_summary.json using the pipeline-specific benchmark_threshold or prototype_threshold_calibrated field; --threshold VALUE explicitly overrides it.
 
-Optional risk assessment can later be attached with `--risk-json path/to/risk_assessment.json`. Outputs are `agentic_investigation_<EVENT_ID>.json` and `agentic_investigation_<EVENT_ID>.md`. Read [attack_graph/AGENTIC_INVESTIGATION.md](attack_graph/AGENTIC_INVESTIGATION.md) for details. Replace `EVT-00001` with an event ID actually present in `attack_events.csv`.
+For deterministic graph evidence without an LLM call, add --offline. Offline mode is graph analysis only and is not an agentic result.
+
+OpenAI hosting is optional and explicitly selected. Keep OPENAI_API_KEY in the local environment, never commit it, and add --provider openai to the command. Hosted API usage may incur charges.
+
+Outputs are agentic_investigation_<EVENT_ID>.json and agentic_investigation_<EVENT_ID>.md inside the selected output directory.
+
 
 For the closest local reproduction, use the Python/package versions documented in `requirements-benchmark.txt`. Exact numerical agreement should be checked in the same Colab runtime used for the reference; Windows is the integration environment:
 
