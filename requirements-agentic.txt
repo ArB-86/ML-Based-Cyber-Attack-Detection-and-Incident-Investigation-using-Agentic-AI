@@ -1,0 +1,4 @@
+# Agentic investigation dependencies
+# Existing benchmark requirements stay unchanged. Install this optional dependency
+# only if you want live LLM investigations.
+openai>=1.40.0
