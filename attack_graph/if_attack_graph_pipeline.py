@@ -16,7 +16,7 @@ def run(
     **kwargs,
 ) -> None:
     """Compatibility wrapper; use attack_graph.pipeline as the main entry."""
-    allowed = {"benchmark_parquet", "verify_only"}
+    allowed = {"benchmark_parquet", "verify_only", "reasoner"}
     unknown = set(kwargs) - allowed
     if unknown:
         raise TypeError(
@@ -29,6 +29,7 @@ def run(
         output_dir=output_dir,
         benchmark_parquet=kwargs.get("benchmark_parquet"),
         verify_only=bool(kwargs.get("verify_only", False)),
+        reasoner=kwargs.get("reasoner"),
     ))
 
 
