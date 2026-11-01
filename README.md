@@ -76,7 +76,7 @@ These are hunt heuristics, not calibrated classifiers. Fixed time buckets can mi
 
 ### Correlation and incident formation
 
-Events are linked independently by shared source, shared destination, shared destination service and target-to-source host pivots. Connected event components form candidate incidents. The graph includes a first-class `incident` node with risk/severity attributes and `contains` edges to its event nodes. Correlation output is inspectable in `event_correlations.csv` rather than being hidden inside an aggregate report.
+Event correlation is a distinct stage implemented by `EventCorrelationAgent`. It emits an inspectable relationship table before incident formation, linking events independently by shared source, shared destination, shared destination service and target-to-source host pivots. `IncidentFormationAgent` consumes this table and groups connected event components into candidate incidents. Only then is the incident-linked attack graph assembled, with a first-class incident node and `contains` edges to member events. The exact edge types, shared entities, time gaps and overlaps are retained in `event_correlations.csv`.
 
 ### Risk assessment
 
@@ -84,9 +84,9 @@ The priority score combines detection-rule diversity, event persistence, source 
 
 ### Tool-driven investigation
 
-`AgenticInvestigationAgent` executes a predefined read-only tool plan: `get_incident`, `get_timeline`, `get_graph_neighborhood` and `get_detection_evidence`. Each tool call records its arguments, a result summary and event evidence references. Findings include the event IDs and graph edges supporting each claim.
+`AgenticInvestigationAgent` first retrieves the incident, chronological timeline, graph neighbourhood and detector provenance. It then exposes a bounded read-only tool registry: `get_event`, `get_host_activity`, `get_service_activity` and `get_correlated_events`. A reasoner can select up to five additional tools in one round. Every call records arguments, result summaries, status and event references. Model findings are accepted only when they cite event IDs inside the current incident; unsupported or cross-incident claims are rejected.
 
-The default mode is a deterministic, tool-assisted baseline. A project-specific LLM reasoner can be injected into `run_soc_investigation(..., reasoner=...)` using the evidence bundle; this keeps model-server configuration separate from incident orchestration. This GitHub repository does not currently contain an Ollama client/runtime integration, and these changes do not modify Ollama.
+The default mode is a deterministic, tool-assisted baseline. The existing local LLM/Ollama reasoner can be passed as a Python callback in `PipelineConfig(reasoner=...)`; the callback receives an evidence bundle and tool catalogue, and should return structured JSON containing `tool_calls`, `findings` and `narrative` to enable model-directed tool use. Plain text responses are treated as narrative-only. This keeps your model/server/runtime configuration separate from the SOC orchestration code. No Ollama server/model settings are changed by this refactor.
 
 ## Output artefacts
 
