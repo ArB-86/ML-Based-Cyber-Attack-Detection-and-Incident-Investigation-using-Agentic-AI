@@ -705,8 +705,9 @@ def test_t1021_requires_remote_service_port_on_exact_inbound_pivot_edge():
     rows = pd.DataFrame([
         _event("A1", 0, "SRC", "PIVOT", 80),
         _event("A2", 1, "PIVOT", "DEST", 443),
-        _event("B1", 2, "OTHER", "HOST", 3389),
+        _event("B1", 2, "OTHER", "HOST", 80),
         _event("B2", 3, "HOST", "DEST2", 443),
+        _event("UNRELATED", 4, "X", "Y", 3389),
     ])
     graph_data = {
         "pivot_hosts": ["PIVOT", "HOST"],
