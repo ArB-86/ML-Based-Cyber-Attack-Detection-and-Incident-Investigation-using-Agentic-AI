@@ -1839,14 +1839,14 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         "",
         f"- **Graph-pattern confidence:** {assessment.get('graph_pattern_confidence', 'Not established')}",
         f"- **Operational impact:** {assessment.get('impact_status', 'Unknown')}",
-        f"- **Selected graph node:** \`{selected_node}\`",
+        f"- **Selected graph node:** `{selected_node}`",
         "",
         "## 2. Selected event and direct graph position",
         "",
         f"- **Event:** {event_id}",
         f"- **Dataset label:** {target.get('attack_type', 'unknown')}",
-        f"- **Source:** \`host:{target.get('src_ip', 'unknown')}\`",
-        f"- **Destination:** \`host:{target.get('dst_ip', 'unknown')}\`",
+        f"- **Source:** `host:{target.get('src_ip', 'unknown')}`",
+        f"- **Destination:** `host:{target.get('dst_ip', 'unknown')}`",
         f"- **Protocol / grouped flow records:** {target.get('protocol', 'unknown')} / {target.get('flow_count', 'unknown')}",
         "",
         "Immediate edges show how the selected event is represented in the existing graph:",
@@ -1856,11 +1856,11 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
     relations = assessment.get("selected_event_relations", {})
     for item in relations.get("incoming", []):
         lines.append(
-            f"- Incoming: \`{item.get('source')}\` --**{item.get('relation')}**--> \`{selected_node}\`"
+            f"- Incoming: `{item.get('source')}` --**{item.get('relation')}**--> `{selected_node}`"
         )
     for item in relations.get("outgoing", []):
         lines.append(
-            f"- Outgoing: \`{selected_node}\` --**{item.get('relation')}**--> \`{item.get('target')}\`"
+            f"- Outgoing: `{selected_node}` --**{item.get('relation')}**--> `{item.get('target')}`"
         )
     if not relations.get("incoming") and not relations.get("outgoing"):
         lines.append("- No direct graph edges were returned for the selected event.")
@@ -1875,7 +1875,7 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         "",
         "### Source-host investigation",
         "",
-        f"- Node: \`host:{target.get('src_ip', 'unknown')}\`",
+        f"- Node: `host:{target.get('src_ip', 'unknown')}`",
         f"- Event nodes initiated: **{source.get('event_count', 0)}**",
         f"- Distinct destination hosts: **{source.get('distinct_peer_host_count', 0)}**",
         f"- Destination hosts observed: {', '.join(source.get('distinct_peer_hosts', [])) or 'none returned'}",
@@ -1890,7 +1890,7 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         "",
         "### Destination-host investigation",
         "",
-        f"- Node: \`host:{target.get('dst_ip', 'unknown')}\`",
+        f"- Node: `host:{target.get('dst_ip', 'unknown')}`",
         f"- Event nodes targeting this host: **{destination.get('event_count', 0)}**",
         f"- Distinct source hosts: **{destination.get('distinct_peer_host_count', 0)}**",
         f"- Source hosts observed: {', '.join(destination.get('distinct_peer_hosts', [])) or 'none returned'}",
@@ -1907,7 +1907,7 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         "",
         "### Attack-type cluster and exact-tuple test",
         "",
-        f"- Category node: \`attack:{target.get('attack_type', 'unknown')}\`",
+        f"- Category node: `attack:{target.get('attack_type', 'unknown')}`",
         f"- Events linked to category: **{cluster.get('event_count', 0)}**",
         f"- Distinct sources / destinations in category cluster: **{cluster.get('distinct_source_count', 0)} / {cluster.get('distinct_destination_count', 0)}**",
         f"- Exact same source + destination + category tuple: **{exact_tuple.get('event_count', 0)} event(s)**",
@@ -1997,7 +1997,7 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         for item in agent_run.get("trace", []):
             if item.get("tool"):
                 lines.append(
-                    f"- Round {item.get('round')}: \`{item.get('tool')}\` — {item.get('status', 'unknown')}"
+                    f"- Round {item.get('round')}: `{item.get('tool')}` — {item.get('status', 'unknown')}"
                 )
                 if item.get("purpose"):
                     lines.append(f"  - Investigation question: {item.get('purpose')}")
@@ -2047,7 +2047,7 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         f"- Full graph: {metrics.get('full_graph_nodes', 0)} nodes / {metrics.get('full_graph_edges', 0)} edges",
         "",
     ])
-    path.write_text("\\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 
