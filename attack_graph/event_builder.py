@@ -58,7 +58,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename: dict[str, str] = {}
     lower_to_original = {str(column).strip().lower(): column for column in out.columns}
     for canonical, names in aliases.items():
-        if canonical in lower_to_original:
+        already_present = lower_to_original.get(canonical)
+        if already_present is not None:
+            if already_present != canonical:
+                rename[already_present] = canonical
             continue
         actual = _first_existing(out.columns, names)
         if actual is not None and actual != canonical:
