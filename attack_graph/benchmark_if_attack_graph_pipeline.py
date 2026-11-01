@@ -691,26 +691,32 @@ def run(
         model.fit(x.iloc[train_benign_idx])
 
     if benchmark_parquet:
-        # Benchmark quality was already evaluated on the exact Parquet test set.
-        # Do not present a metadata-CSV split evaluation as benchmark performance.
+        # Retain the historical benchmark threshold only for runs explicitly
+        # tied to the reference Parquet verification path.
         val_metrics = None
         test_metrics = exact_result["test"]
+        active_threshold = FINAL_THRESHOLD
     else:
         val_scores = model.decision_function(x.iloc[val_idx])
         test_scores = model.decision_function(x.iloc[test_idx])
+        validation_benign = y.iloc[val_idx].to_numpy() == 0
+        if not validation_benign.any():
+            raise ValueError("Validation split contains no benign rows for threshold calibration.")
+        # Calibrate to a 5% validation-benign alert budget. Do not optimise
+        # threshold on validation F1 or inspect held-out test labels.
+        active_threshold = float(np.quantile(val_scores[validation_benign], 0.05))
+        val_metrics = evaluate(y.iloc[val_idx], val_scores, active_threshold)
+        test_metrics = evaluate(y.iloc[test_idx], test_scores, active_threshold)
 
-        val_metrics = evaluate(y.iloc[val_idx], val_scores, FINAL_THRESHOLD)
-        test_metrics = evaluate(y.iloc[test_idx], test_scores, FINAL_THRESHOLD)
-
-        print("\nVALIDATION")
+        print("\nVALIDATION (5% benign-tail threshold calibration)")
         print(json.dumps(val_metrics, indent=2))
-        print("\nTEST")
+        print("\nHELD-OUT TEST")
         print(json.dumps(test_metrics, indent=2))
 
-    # Score every cleaned flow using the model trained only on training BENIGN rows.
+    # Isolation Forest is one detector in a broader alert pipeline.
     all_scores = model.decision_function(x)
     df["anomaly_score"] = all_scores
-    df["predicted_anomaly"] = all_scores < FINAL_THRESHOLD
+    df["predicted_anomaly"] = all_scores < active_threshold
     split = np.full(len(df), "train", dtype=object)
     split[val_idx] = "validation"
     split[test_idx] = "test"
