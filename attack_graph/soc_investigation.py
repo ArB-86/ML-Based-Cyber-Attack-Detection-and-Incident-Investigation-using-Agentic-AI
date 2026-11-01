@@ -1326,8 +1326,17 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             f"**Window:** {item['start_time']} to {item['end_time']} ({item['duration_seconds']:.1f}s)", "",
             f"**Observed scope:** {len(item['event_ids'])} events, {item['total_flows']:,} flows, {g['unique_sources']} sources and {g['unique_targets']} destinations.",
             f"**Detection evidence:** {', '.join(item['detection_reasons']) or 'No behavioural rule token'}.",
-            f"**Graph structure:** {g['graph_event_links']} event-to-event links, {g['unique_services']} destination services, pivot hosts: {', '.join(g['pivot_hosts']) or 'none observed'}.", "",
-            "**Source-side leads:**",
+            f"**Graph structure:** {g['graph_event_links']} event-to-event links, density {g.get('graph_density', 0.0):.4f}, {g['unique_services']} destination services, pivot hosts: {', '.join(g['pivot_hosts']) or 'none observed'}.",
+            f"**Graph relationship types:** {', '.join(f'{name}={count}' for name, count in g.get('edge_relation_counts', {}).items()) or 'no correlated edges'}.",
+            f"**Risk score components:** {', '.join(f'{name}={detail['contribution_points']:.1f}' for name, detail in triage.get('components', {}).items()) or 'not available'}.", "",
+            "**Top central events:**",
+        ])
+        for central in g.get("top_central_events", [])[:5]:
+            lines.append(
+                f"- {central['event_id']}: degree centrality {central['degree_centrality']:.4f}, "
+                f"betweenness centrality {central['betweenness_centrality']:.4f}"
+            )
+        lines.extend(["", "**Source-side leads:**",
         ])
         for lead in g["top_sources"][:3]:
             lines.append(f"- {lead['ip']} — {lead['unique_targets']} distinct destinations")
@@ -1362,9 +1371,16 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             f"- Tools executed: {len(investigation.get('tool_calls', []))}",
             f"- Evidence-linked findings: {len(investigation.get('findings', []))}",
         ])
+        if investigation.get("narrative"):
+            lines.append(f"- Analyst synthesis: {investigation['narrative']}")
         for finding in investigation.get("findings", [])[:8]:
             refs = ", ".join(finding.get("evidence_event_ids", []))
             lines.append(f"- {finding['claim']} Evidence: {refs or 'not linked'}")
+        lines.append(
+            f"- Model findings accepted/rejected: "
+            f"{investigation.get('model_findings_accepted', 0)}/"
+            f"{investigation.get('model_findings_rejected', 0)}"
+        )
         lines.extend(["", f"**Evidence event IDs:** {', '.join(item['event_ids'])}", "", "---", ""])
 
     lines.extend([
