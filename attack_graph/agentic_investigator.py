@@ -1611,36 +1611,82 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
             f"- Connected-component event count: {graph_analysis.get('connected_component', {}).get('event_count', 0)}.",
             f"- Attack-type cluster event count: {graph_analysis.get('attack_type_cluster', {}).get('event_count', 0)}.",
         ])
+        lines.append(
+            "- Connected-component and attack-type-cluster membership describe graph links only; "
+            "they do not prove one incident, campaign or successful impact."
+        )
         component_events = graph_analysis.get("connected_component", {}).get("event_ids", [])
         if component_events:
-            lines.append(f"- Connected event IDs: {', '.join(str(x) for x in component_events[:30])}.")
-        cluster = graph_analysis.get("attack_type_cluster", {})
-        if cluster.get("event_ids"):
+            shown_component_events = component_events[:30]
+            truncation_note = (
+                f" (showing {len(shown_component_events)} of {len(component_events)})"
+                if len(component_events) > len(shown_component_events) else ""
+            )
             lines.append(
-                f"- Events linked to attack-type node {cluster.get('attack_type')}: "
-                f"{', '.join(str(x) for x in cluster.get('event_ids', [])[:30])}."
+                f"- Connected event IDs{truncation_note}: "
+                f"{', '.join(str(x) for x in shown_component_events)}."
+            )
+        cluster = graph_analysis.get("attack_type_cluster", {})
+        cluster_events = cluster.get("event_ids", [])
+        if cluster_events:
+            shown_cluster_events = cluster_events[:30]
+            truncation_note = (
+                f" (showing {len(shown_cluster_events)} of {len(cluster_events)})"
+                if len(cluster_events) > len(shown_cluster_events) else ""
+            )
+            lines.append(
+                f"- Events linked to attack-type node {cluster.get('attack_type')}{truncation_note}: "
+                f"{', '.join(str(x) for x in shown_cluster_events)}."
             )
         neighborhood_edges = graph_analysis.get("neighborhood", {}).get("edges", [])
         if neighborhood_edges:
-            lines.extend(["", "### Relation-labelled graph edges"])
-            for edge in neighborhood_edges[:35]:
+            target_node = f"event:{payload.get('event_id')}"
+            neighborhood_edges = sorted(
+                neighborhood_edges,
+                key=lambda edge: (
+                    0 if target_node in {str(edge.get("source")), str(edge.get("target"))} else 1,
+                    str(edge.get("relation", "")),
+                    str(edge.get("source", "")),
+                    str(edge.get("target", "")),
+                ),
+            )
+            edge_limit = 35
+            lines.extend([
+                "",
+                f"### Relation-labelled graph edges (showing {min(edge_limit, len(neighborhood_edges))} of {len(neighborhood_edges)})",
+            ])
+            for edge in neighborhood_edges[:edge_limit]:
                 lines.append(
                     f"- {edge.get('source')} --{edge.get('relation')}--> {edge.get('target')}"
                 )
         temporal_sequence = graph_analysis.get("temporal_sequence", {}).get("sequence", [])
         if temporal_sequence:
-            lines.extend(["", "### Explicit temporal sequence"])
-            for item in temporal_sequence[:30]:
+            temporal_limit = 30
+            lines.extend([
+                "",
+                f"### Explicit temporal sequence (showing {min(temporal_limit, len(temporal_sequence))} of {len(temporal_sequence)})",
+            ])
+            for item in temporal_sequence[:temporal_limit]:
                 lines.append(
                     f"- {item.get('start_time', 'unknown')} — {item.get('event_id')}: "
                     f"{item.get('attack_type')} ({item.get('src_ip')} -> {item.get('dst_ip')})"
                 )
+            lines.append(
+                "- Sequence is taken from explicit graph 'precedes' edges; identical displayed timestamps "
+                "do not establish sub-minute ordering."
+            )
         else:
             lines.append("- No explicit temporal sequence around the selected event was established from 'precedes' edges.")
-        shared = graph_analysis.get("shared_host_events", {}).get("relationships", [])
-        lines.extend(["", "### Shared-host relationships"])
+        shared_summary = graph_analysis.get("shared_host_events", {})
+        shared = shared_summary.get("relationships", [])
+        shared_limit = 30
+        shared_count = shared_summary.get("relationship_count", len(shared))
+        lines.extend([
+            "",
+            f"### Shared-host relationships (showing {min(shared_limit, len(shared))} of {shared_count})",
+        ])
         if shared:
-            for item in shared[:30]:
+            for item in shared[:shared_limit]:
                 lines.append(
                     f"- {item.get('host_node')} ({item.get('role_for_selected_event')}): "
                     f"{item.get('related_event_id')}"
@@ -1648,9 +1694,14 @@ def _write_markdown(payload: dict[str, Any], path: Path) -> None:
         else:
             lines.append("- No other event nodes were found adjacent to the selected source/destination host nodes.")
         paths = graph_analysis.get("structural_paths", {}).get("paths", [])
-        lines.extend(["", "### Structural paths"])
+        paths_returned = graph_analysis.get("structural_paths", {}).get("paths_returned", len(paths))
+        path_limit = 10
+        lines.extend([
+            "",
+            f"### Structural paths (showing {min(path_limit, len(paths))} of {paths_returned})",
+        ])
         if paths:
-            for item in paths[:10]:
+            for item in paths[:path_limit]:
                 lines.append(" - " + " -> ".join(str(node.get("id")) for node in item))
             lines.append("- Paths represent graph connectivity only, not confirmed attacker movement.")
         else:
