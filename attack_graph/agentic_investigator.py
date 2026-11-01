@@ -932,7 +932,7 @@ def _ask_llm(
     provider = provider.strip().lower()
     if provider == "ollama":
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        model_name = model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        model_name = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         client = OpenAI(base_url=base_url, api_key="ollama")
     elif provider == "openai":
         if not os.getenv("OPENAI_API_KEY"):
@@ -963,7 +963,7 @@ def _ask_llm(
         if provider == "ollama":
             raise RuntimeError(
                 "Could not call the local Ollama model. Confirm Ollama is installed "
-                "and running, then run ollama pull qwen2.5:3b. Default local API: "
+                "and running, then run ollama pull qwen2.5:7b. Default local API: "
                 f"{base_url}. Original error: {exc}"
             ) from exc
         raise
