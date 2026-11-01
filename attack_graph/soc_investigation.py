@@ -322,6 +322,36 @@ class IncidentTriageAgent:
         }
 
 
+
+
+class IncidentFormationAgent:
+    """Turn the correlated event graph into stable candidate incident groups."""
+
+    def __init__(self, graph: nx.DiGraph, events: pd.DataFrame):
+        self.graph = graph
+        self.events = events
+
+    def form(self) -> list[tuple[pd.Timestamp, set[str], pd.DataFrame]]:
+        event_nodes = {
+            node for node, attrs in self.graph.nodes(data=True)
+            if attrs.get("node_type") == "event"
+        }
+        correlated = nx.Graph()
+        correlated.add_nodes_from(event_nodes)
+        for source, target, attrs in self.graph.edges(data=True):
+            if source in event_nodes and target in event_nodes:
+                correlated.add_edge(source, target, **attrs)
+
+        components = []
+        for component in nx.connected_components(correlated):
+            event_ids = {node.removeprefix("event:") for node in component}
+            rows = self.events[self.events["event_id"].astype(str).isin(event_ids)].copy()
+            if not rows.empty:
+                components.append((rows["start_time"].min(), set(component), rows))
+        components.sort(key=lambda item: item[0])
+        return components
+
+
 class SOCInvestigationOrchestrator:
     """Coordinate graph analyst, threat hunter and incident triage stages."""
     def __init__(self, events: pd.DataFrame, graph: nx.DiGraph):
@@ -336,13 +366,9 @@ class SOCInvestigationOrchestrator:
             self.anomaly_strength = {}
 
     def run(self) -> list[dict[str, Any]]:
-        components = []
-        for component in nx.connected_components(self.graph_agent.event_graph):
-            ids = [node.removeprefix("event:") for node in component]
-            rows = self.events[self.events["event_id"].astype(str).isin(ids)]
-            if not rows.empty:
-                components.append((rows["start_time"].min(), component, rows))
-        components.sort(key=lambda item: item[0])
+        components = IncidentFormationAgent(
+            self.graph, self.events
+        ).form()
         incidents = []
         for number, (_, component, rows) in enumerate(components, start=1):
             ids = sorted(rows["event_id"].astype(str).tolist())
@@ -386,6 +412,25 @@ class SOCInvestigationOrchestrator:
                 ],
                 "recommended_actions": self._actions(reasons, graph_data),
             }
+            incident_node = f"incident:{incident['incident_id']}"
+            self.graph.add_node(
+                incident_node,
+                node_type="incident",
+                label=incident["incident_id"],
+                title=incident["title"],
+                status=incident["status"],
+                risk_score=float(triage["risk_score"]),
+                severity=triage["severity"],
+                confidence=triage["confidence"],
+                event_count=len(ids),
+            )
+            for event_id in ids:
+                _add_edge(
+                    self.graph,
+                    incident_node,
+                    f"event:{event_id}",
+                    "contains",
+                )
             incidents.append(incident)
         incidents.sort(key=lambda item: (item["triage"]["risk_score"], item["start_time"]), reverse=True)
         return incidents
@@ -424,6 +469,284 @@ class SOCInvestigationOrchestrator:
             actions.append("Do not assign an ATT&CK technique yet; gather endpoint, identity and application evidence first.")
         actions.append("Apply isolation or blocking only after analyst validation of evidence, ownership and business impact.")
         return actions
+
+
+
+
+class IncidentEvidenceTools:
+    """Read-only tools exposed to the investigation agent."""
+
+    def __init__(
+        self,
+        incidents: list[dict[str, Any]],
+        events: pd.DataFrame,
+        graph: nx.DiGraph,
+    ):
+        self.incidents = {item["incident_id"]: item for item in incidents}
+        self.events = {str(row["event_id"]): row.to_dict() for _, row in events.iterrows()}
+        self.graph = graph
+
+    def get_incident(self, incident_id: str) -> dict[str, Any]:
+        if incident_id not in self.incidents:
+            raise KeyError(f"Unknown incident_id: {incident_id}")
+        item = self.incidents[incident_id]
+        return {
+            "incident_id": item["incident_id"],
+            "title": item["title"],
+            "start_time": item["start_time"],
+            "end_time": item["end_time"],
+            "event_ids": list(item["event_ids"]),
+            "detection_reasons": list(item["detection_reasons"]),
+            "triage": dict(item["triage"]),
+            "graph_analysis": dict(item["graph_analysis"]),
+        }
+
+    def get_event(self, event_id: str) -> dict[str, Any]:
+        if event_id not in self.events:
+            raise KeyError(f"Unknown event_id: {event_id}")
+        row = self.events[event_id]
+        return {
+            key: (value.isoformat() if isinstance(value, pd.Timestamp) else value)
+            for key, value in row.items()
+        }
+
+    def get_timeline(self, incident_id: str) -> list[dict[str, Any]]:
+        incident = self.get_incident(incident_id)
+        return [
+            self.get_event(event_id)
+            for event_id in incident["event_ids"]
+        ]
+
+    def get_graph_neighborhood(self, incident_id: str) -> dict[str, Any]:
+        incident = self.get_incident(incident_id)
+        incident_node = f"incident:{incident_id}"
+        if incident_node not in self.graph:
+            raise KeyError(f"Incident graph node is missing: {incident_id}")
+
+        neighborhood = []
+        for event_node in self.graph.successors(incident_node):
+            for neighbor in set(self.graph.predecessors(event_node)) | set(self.graph.successors(event_node)):
+                if neighbor == incident_node:
+                    continue
+                attrs = self.graph.nodes[neighbor]
+                neighborhood.append({
+                    "node_id": str(neighbor),
+                    "node_type": str(attrs.get("node_type", "unknown")),
+                    "label": str(attrs.get("label", neighbor)),
+                })
+
+        edges = []
+        members = {f"event:{event_id}" for event_id in incident["event_ids"]}
+        for source, target, attrs in self.graph.edges(data=True):
+            if source in members and target in members:
+                edges.append({
+                    "from": str(source),
+                    "to": str(target),
+                    "relation": str(attrs.get("relations", attrs.get("relation", ""))),
+                    "gap_seconds": attrs.get("gap_seconds"),
+                    "pivot_host": attrs.get("pivot_host"),
+                    "shared_entity": attrs.get("shared_entity"),
+                })
+        unique_nodes = {item["node_id"]: item for item in neighborhood}
+        return {
+            "incident_node": incident_node,
+            "member_event_nodes": sorted(members),
+            "related_nodes": sorted(unique_nodes.values(), key=lambda item: item["node_id"]),
+            "event_edges": edges,
+        }
+
+    def get_detection_evidence(self, incident_id: str) -> dict[str, Any]:
+        timeline = self.get_timeline(incident_id)
+        by_reason: dict[str, list[str]] = {}
+        by_source: dict[str, list[str]] = {}
+        for event in timeline:
+            event_id = str(event["event_id"])
+            for reason in str(event.get("detection_reasons", "")).split(";"):
+                reason = reason.strip()
+                if reason:
+                    by_reason.setdefault(reason, []).append(event_id)
+            for source in str(event.get("alert_sources", "")).split(";"):
+                source = source.strip()
+                if source:
+                    by_source.setdefault(source, []).append(event_id)
+        return {
+            "reason_to_event_ids": {
+                key: sorted(set(value)) for key, value in sorted(by_reason.items())
+            },
+            "source_to_event_ids": {
+                key: sorted(set(value)) for key, value in sorted(by_source.items())
+            },
+        }
+
+
+class AgenticInvestigationAgent:
+    """Execute an auditable, tool-driven investigation plan.
+
+    A project-specific LLM reasoner can be injected without coupling this
+    orchestration layer to a model server or changing its runtime settings.
+    Without a reasoner, the agent emits a deterministic evidence synthesis.
+    """
+
+    def __init__(self, tools: IncidentEvidenceTools, reasoner=None):
+        self.tools = tools
+        self.reasoner = reasoner
+
+    def investigate(self, incident_id: str) -> dict[str, Any]:
+        tool_calls: list[dict[str, Any]] = []
+
+        def execute(name: str, arguments: dict[str, Any], function):
+            result = function(**arguments)
+            tool_calls.append({
+                "tool": name,
+                "arguments": arguments,
+                "result_summary": self._summarize(name, result),
+                "evidence_refs": self._evidence_refs(name, result),
+            })
+            return result
+
+        incident = execute(
+            "get_incident",
+            {"incident_id": incident_id},
+            self.tools.get_incident,
+        )
+        timeline = execute(
+            "get_timeline",
+            {"incident_id": incident_id},
+            self.tools.get_timeline,
+        )
+        graph = execute(
+            "get_graph_neighborhood",
+            {"incident_id": incident_id},
+            self.tools.get_graph_neighborhood,
+        )
+        detections = execute(
+            "get_detection_evidence",
+            {"incident_id": incident_id},
+            self.tools.get_detection_evidence,
+        )
+
+        claims: list[dict[str, Any]] = []
+        for reason, event_ids in detections["reason_to_event_ids"].items():
+            claims.append({
+                "claim": f"Detection signal {reason} contributed to this candidate incident.",
+                "evidence_event_ids": event_ids,
+                "evidence_edges": [],
+                "confidence": "high" if len(event_ids) >= 2 else "medium",
+            })
+
+        analysis = incident["graph_analysis"]
+        if analysis["max_source_fanout"] > 1:
+            claims.append({
+                "claim": (
+                    f"The most active source contacted {analysis['max_source_fanout']} "
+                    "distinct destinations within the candidate incident."
+                ),
+                "evidence_event_ids": list(incident["event_ids"]),
+                "evidence_edges": [],
+                "confidence": "medium",
+            })
+        if analysis["max_target_fanin"] > 1:
+            claims.append({
+                "claim": (
+                    f"The most targeted destination received traffic from "
+                    f"{analysis['max_target_fanin']} distinct sources."
+                ),
+                "evidence_event_ids": list(incident["event_ids"]),
+                "evidence_edges": [],
+                "confidence": "medium",
+            })
+        pivot_edges = [
+            edge for edge in graph["event_edges"]
+            if "host_pivot" in edge["relation"]
+        ]
+        for edge in pivot_edges:
+            claims.append({
+                "claim": (
+                    f"Host {edge['pivot_host']} was targeted and subsequently "
+                    "initiated another correlated connection; this is a pivot lead."
+                ),
+                "evidence_event_ids": [
+                    edge["from"].removeprefix("event:"),
+                    edge["to"].removeprefix("event:"),
+                ],
+                "evidence_edges": [edge],
+                "confidence": "medium",
+            })
+
+        for hypothesis in incident["graph_analysis"].get("attack_hypotheses", []):
+            pass
+
+        result = {
+            "agent": "AgenticInvestigationAgent",
+            "mode": "tool_assisted",
+            "status": "completed",
+            "plan": [
+                "retrieve_incident_context",
+                "inspect_chronological_event_timeline",
+                "inspect_correlated_graph_neighborhood",
+                "cross_check_detection_provenance",
+                "synthesise_evidence_linked_findings",
+            ],
+            "tool_calls": tool_calls,
+            "findings": claims,
+            "attack_hypotheses": incident.get("attack_hypotheses", []),
+            "recommended_actions": [],
+            "narrative": (
+                f"{incident['title']}. The candidate contains {len(timeline)} correlated "
+                f"events over {incident['start_time']} to {incident['end_time']}. "
+                f"Observed detection signals: {', '.join(incident['detection_reasons']) or 'none recorded'}. "
+                f"Graph evidence contains {len(graph['event_edges'])} event-to-event relationships. "
+                "Treat the result as a candidate incident pending validation against endpoint, "
+                "identity and service telemetry."
+            ),
+        }
+        if self.reasoner is not None:
+            result["narrative"] = self.reasoner({
+                "incident": incident,
+                "timeline": timeline,
+                "graph": graph,
+                "detections": detections,
+                "evidence_linked_findings": claims,
+            })
+            result["mode"] = "tool_assisted_llm"
+        return result
+
+    @staticmethod
+    def _summarize(name: str, result: Any) -> dict[str, Any]:
+        if name == "get_timeline":
+            return {"event_count": len(result)}
+        if name == "get_graph_neighborhood":
+            return {
+                "event_edge_count": len(result["event_edges"]),
+                "related_node_count": len(result["related_nodes"]),
+            }
+        if name == "get_detection_evidence":
+            return {
+                "detection_reason_count": len(result["reason_to_event_ids"]),
+                "alert_source_count": len(result["source_to_event_ids"]),
+            }
+        return {
+            "incident_id": result["incident_id"],
+            "event_count": len(result["event_ids"]),
+            "severity": result["triage"]["severity"],
+        }
+
+    @staticmethod
+    def _evidence_refs(name: str, result: Any) -> list[str]:
+        if name == "get_timeline":
+            return [str(item["event_id"]) for item in result]
+        if name == "get_graph_neighborhood":
+            return [
+                item.removeprefix("event:")
+                for item in result["member_event_nodes"]
+            ]
+        if name == "get_detection_evidence":
+            return sorted({
+                event_id
+                for event_ids in result["reason_to_event_ids"].values()
+                for event_id in event_ids
+            })
+        return list(result.get("event_ids", []))
 
 
 def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: nx.DiGraph, path: Path) -> None:
@@ -514,17 +837,65 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def run_soc_investigation(alert_flows: pd.DataFrame, output_dir: str | Path) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
-    """Build the SOC graph, run analyst stages and write structured report artefacts."""
+def run_soc_investigation(
+    alert_flows: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    reasoner=None,
+) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
+    """Run correlation -> incident formation -> graph -> risk -> agent tools -> report."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     events = build_soc_events(alert_flows)
+    return run_soc_investigation_from_events(events, out, reasoner=reasoner)
+
+
+def run_soc_investigation_from_events(
+    events: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    reasoner=None,
+) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
+    """Continue the canonical workflow from an already-formed event table."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    events = events.copy()
+    required = {
+        "event_id", "start_time", "end_time", "src_ip", "dst_ip",
+        "protocol", "flow_count",
+    }
+    missing = required - set(events.columns)
+    if missing:
+        raise ValueError(f"Event contract is missing columns: {sorted(missing)}")
+    if "detection_reasons" not in events.columns:
+        events["detection_reasons"] = "LEGACY_EVENT_IMPORT"
+    if "alert_sources" not in events.columns:
+        events["alert_sources"] = "LEGACY_EVENT_IMPORT"
+    if "attack_type" not in events.columns:
+        events["attack_type"] = events["detection_reasons"]
+    if "mean_anomaly_score" not in events.columns:
+        events["mean_anomaly_score"] = pd.NA
+    if "dst_ports" not in events.columns:
+        events["dst_ports"] = [[] for _ in range(len(events))]
     for column in ("start_time", "end_time"):
         if not events.empty:
             events[column] = pd.to_datetime(events[column], errors="coerce", utc=True, format="mixed")
+    if not events.empty and events[["start_time", "end_time"]].isna().any().any():
+        raise ValueError("Event contract contains invalid timestamps.")
+
     events.to_csv(out / "attack_events.csv", index=False)
     graph = build_soc_graph(events)
     incidents = SOCInvestigationOrchestrator(events, graph).run() if not events.empty else []
+
+    evidence_tools = IncidentEvidenceTools(incidents, events, graph)
+    agent = AgenticInvestigationAgent(evidence_tools, reasoner=reasoner)
+    for incident in incidents:
+        investigation = agent.investigate(incident["incident_id"])
+        incident["investigation_agent"] = investigation
+        incident["recommended_actions"] = incident["recommended_actions"] + [
+            action for action in investigation["recommended_actions"]
+            if action not in incident["recommended_actions"]
+        ]
 
     incident_map: dict[str, dict[str, Any]] = {}
     for incident in incidents:
@@ -543,26 +914,102 @@ def run_soc_investigation(alert_flows: pd.DataFrame, output_dir: str | Path) -> 
         evidence = evidence.sort_values(["incident_risk_score", "start_time"], ascending=[False, True])
     evidence.to_csv(out / "incident_investigation.csv", index=False)
 
+    correlation_rows = []
+    event_nodes = {
+        node for node, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "event"
+    }
+    for source, target, attrs in graph.edges(data=True):
+        if source in event_nodes and target in event_nodes:
+            correlation_rows.append({
+                "from_event": str(source).removeprefix("event:"),
+                "to_event": str(target).removeprefix("event:"),
+                "relation": str(attrs.get("relations", attrs.get("relation", ""))),
+                "gap_seconds": attrs.get("gap_seconds"),
+                "shared_entity": attrs.get("shared_entity"),
+                "pivot_host": attrs.get("pivot_host"),
+            })
+    correlations = pd.DataFrame(
+        correlation_rows,
+        columns=["from_event", "to_event", "relation", "gap_seconds", "shared_entity", "pivot_host"],
+    )
+    correlations.to_csv(out / "event_correlations.csv", index=False)
+
+    # Persist the incident-level graph only after the incident nodes have been
+    # attached to their member events.
+    from .graph_builder import write_attack_graph_gexf
+    write_attack_graph_gexf(graph, str(out / "attack_graph.gexf"))
+
     payload = {
-        "workflow": "soc_graph_investigation_orchestrator",
+        "workflow": "single_soc_incident_lifecycle",
         "ground_truth_labels_used": False,
         "risk_score_is_probability": False,
+        "stage_sequence": [
+            "alert_ingestion",
+            "event_correlation",
+            "incident_formation",
+            "attack_graph_construction",
+            "incident_risk_assessment",
+            "agentic_tool_investigation",
+            "evidence_backed_reporting",
+        ],
         "event_count": len(events),
+        "correlation_count": len(correlations),
         "incident_count": len(incidents),
         "incidents": incidents,
     }
     (out / "incident_investigation.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     _write_report(incidents, events, graph, out / "incident_investigation_report.md")
+    tool_call_count = sum(
+        len(item.get("investigation_agent", {}).get("tool_calls", []))
+        for item in incidents
+    )
+    manifest = {
+        "pipeline": "cicids2017_soc_incident_investigation",
+        "version": "1.0",
+        "stages": [
+            {"name": "event_correlation", "status": "completed", "output": "attack_events.csv"},
+            {"name": "incident_formation", "status": "completed", "output": "incident_investigation.json"},
+            {"name": "attack_graph", "status": "completed", "output": "attack_graph.gexf"},
+            {"name": "risk_assessment", "status": "completed", "output": "incident_investigation.json"},
+            {"name": "agentic_investigation", "status": "completed", "tool_calls": tool_call_count},
+            {"name": "reporting", "status": "completed", "output": "incident_investigation_report.md"},
+        ],
+        "counts": {
+            "alerts": int(len(alert_flows)) if "alert_flows" in locals() else None,
+            "events": len(events),
+            "correlations": len(correlations),
+            "incidents": len(incidents),
+            "graph_nodes": graph.number_of_nodes(),
+            "graph_edges": graph.number_of_edges(),
+            "agent_tool_calls": tool_call_count,
+        },
+        "artifacts": [
+            "attack_events.csv",
+            "event_correlations.csv",
+            "attack_graph.gexf",
+            "incident_investigation.csv",
+            "incident_investigation.json",
+            "incident_investigation_report.md",
+        ],
+        "ground_truth_labels_used_for_investigation": False,
+    }
+    (out / "soc_pipeline_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     summary = {
         "incident_count": len(incidents),
         "critical_incidents": sum(i["triage"]["severity"] == "CRITICAL" for i in incidents),
         "high_incidents": sum(i["triage"]["severity"] == "HIGH" for i in incidents),
         "graph_event_links": sum(i["graph_analysis"]["graph_event_links"] for i in incidents),
+        "correlation_count": len(correlations),
+        "agent_tool_calls": tool_call_count,
         "event_count": len(events),
         "graph_nodes": graph.number_of_nodes(),
         "graph_edges": graph.number_of_edges(),
         "report_path": str(out / "incident_investigation_report.md"),
         "json_path": str(out / "incident_investigation.json"),
         "csv_path": str(out / "incident_investigation.csv"),
+        "manifest_path": str(out / "soc_pipeline_manifest.json"),
     }
     return events, graph, summary
