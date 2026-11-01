@@ -694,10 +694,12 @@ class SOCInvestigationOrchestrator:
         events: pd.DataFrame,
         graph: nx.DiGraph,
         correlations: pd.DataFrame,
+        incident_groups: list[tuple[pd.Timestamp, set[str], pd.DataFrame]] | None = None,
     ):
         self.events = events.copy().reset_index(drop=True)
         self.graph = graph
         self.correlations = correlations.copy()
+        self.incident_groups = incident_groups
         self.graph_agent = GraphAnalystAgent(graph)
         scores = pd.to_numeric(self.events.get("mean_anomaly_score", pd.Series(index=self.events.index, dtype=float)), errors="coerce")
         if scores.notna().any():
@@ -707,9 +709,11 @@ class SOCInvestigationOrchestrator:
             self.anomaly_strength = {}
 
     def run(self) -> list[dict[str, Any]]:
-        components = IncidentFormationAgent(
-            self.events, self.correlations
-        ).form()
+        components = (
+            self.incident_groups
+            if self.incident_groups is not None
+            else IncidentFormationAgent(self.events, self.correlations).form()
+        )
         incidents = []
         for number, (_, component, rows) in enumerate(components, start=1):
             ids = sorted(rows["event_id"].astype(str).tolist())
@@ -1616,11 +1620,25 @@ def run_soc_investigation_from_events(
         raise ValueError("Event contract requires positive numeric flow_count values.")
 
     events.to_csv(out / "attack_events.csv", index=False)
+
+    # Stage 1: correlate events into explicit relationship records.
     correlations = EventCorrelationAgent(events, max_gap_seconds=300).correlate()
     correlations.to_csv(out / "event_correlations.csv", index=False)
+
+    # Stage 2: form candidate incidents from the correlation table BEFORE
+    # constructing the incident graph. Each group retains its event IDs.
+    incident_groups = IncidentFormationAgent(events, correlations).form()
+
+    # Stage 3: build the graph from events + correlation links, then attach
+    # incident membership/risk nodes during the subsequent assessment stage.
     graph = build_soc_graph(events, correlations)
     incidents = (
-        SOCInvestigationOrchestrator(events, graph, correlations).run()
+        SOCInvestigationOrchestrator(
+            events,
+            graph,
+            correlations,
+            incident_groups=incident_groups,
+        ).run()
         if not events.empty else []
     )
 
