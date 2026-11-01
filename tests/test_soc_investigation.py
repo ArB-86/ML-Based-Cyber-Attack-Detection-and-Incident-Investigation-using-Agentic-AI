@@ -173,3 +173,87 @@ def test_legacy_investigator_cli_reuses_canonical_workflow(tmp_path):
     assert payload["ground_truth_labels_used"] is False
     assert payload["incidents"][0]["detection_reasons"] == ["LEGACY_EVENT_IMPORT"]
     assert payload["incidents"][0]["investigation_agent"]["tool_calls"]
+
+
+def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 22, "alert": True,
+            "detection_reasons": "BRUTE_FORCE_PATTERN", "alert_sources": "BEHAVIOURAL_RULE",
+            "anomaly_score": 0.01,
+        },
+        {
+            "timestamp": _time(1), "src_ip": "B", "dst_ip": "C", "protocol": 6,
+            "src_port": 22, "dst_port": 445, "alert": True,
+            "detection_reasons": "HIGH_SOURCE_FANOUT", "alert_sources": "BEHAVIOURAL_RULE",
+            "anomaly_score": 0.02,
+        },
+    ])
+    calls = {"count": 0}
+
+    def fake_reasoner(context):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "tool_calls": [
+                    {
+                        "name": "get_host_activity",
+                        "arguments": {"host_ip": "B"},
+                    },
+                    {
+                        "name": "get_correlated_events",
+                        "arguments": {
+                            "event_id": "EVT-000001",
+                            "relation_contains": "host_pivot",
+                        },
+                    },
+                    {
+                        "name": "get_event",
+                        "arguments": {"event_id": "EVT-999999"},
+                    },
+                ],
+                "preliminary_findings": [],
+                "narrative": "Need to inspect pivot host B.",
+            }
+        return {
+            "narrative": "Host B is a pivot lead; validate using endpoint telemetry.",
+            "findings": [
+                {
+                    "claim": "Host B was targeted and later initiated another connection.",
+                    "evidence_event_ids": ["EVT-000001", "EVT-000002"],
+                    "confidence": "medium",
+                },
+                {
+                    "claim": "An unrelated host executed malware.",
+                    "evidence_event_ids": ["EVT-999999"],
+                    "confidence": "high",
+                },
+            ],
+        }
+
+    _, _, summary = run_soc_investigation(flows, tmp_path, reasoner=fake_reasoner)
+    payload = json.loads((tmp_path / "incident_investigation.json").read_text())
+    agent = payload["incidents"][0]["investigation_agent"]
+
+    assert calls["count"] == 2
+    assert agent["mode"] == "tool_assisted_llm"
+    assert agent["model_findings_accepted"] == 1
+    assert agent["model_findings_rejected"] == 1
+    assert any(
+        call["tool"] == "get_host_activity" and call["status"] == "success"
+        for call in agent["tool_calls"]
+    )
+    assert any(
+        call["tool"] == "get_correlated_events" and call["status"] == "success"
+        for call in agent["tool_calls"]
+    )
+    assert any(
+        call["tool"] == "get_event" and call["status"] == "rejected"
+        for call in agent["tool_calls"]
+    )
+    assert any(
+        finding["source"] == "llm_evidence_validated"
+        for finding in agent["findings"]
+    )
+    assert summary["agent_tool_calls"] >= 6
