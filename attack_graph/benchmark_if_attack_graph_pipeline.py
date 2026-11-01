@@ -285,6 +285,32 @@ def load_metadata_dataset(data_dir: Path) -> pd.DataFrame:
         )
         frame = _resolve_columns(frame)
 
+        # Some exported CICIDS CSVs contain a trailing block of fully empty
+        # records. They carry no flow features or metadata and must be removed
+        # at ingestion, before timestamp validation or model preprocessing.
+        # Do not drop partially populated rows: those indicate a real schema/
+        # data-quality problem and should remain visible to validation.
+        empty_rows = frame.isna().all(axis=1)
+        empty_row_count = int(empty_rows.sum())
+        if empty_row_count:
+            print(
+                f"Removed fully empty rows from {filename}: "
+                f"{empty_row_count:,}"
+            )
+            frame = frame.loc[~empty_rows].copy()
+
+        if "timestamp" not in frame.columns:
+            raise ValueError(f"Missing Timestamp column in {filename}")
+        missing_timestamps = (
+            frame["timestamp"].isna()
+            | frame["timestamp"].astype("string").str.strip().eq("")
+        )
+        if missing_timestamps.any():
+            raise ValueError(
+                f"{filename} contains {int(missing_timestamps.sum()):,} "
+                "non-empty flow rows with missing timestamps."
+            )
+
         if "label" not in frame.columns:
             raise ValueError(f"Missing Label column in {filename}")
 
