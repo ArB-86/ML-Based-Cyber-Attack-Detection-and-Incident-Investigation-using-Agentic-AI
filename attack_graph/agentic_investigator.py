@@ -21,17 +21,21 @@ SYSTEM_INSTRUCTIONS = """You are a SOC analyst investigating a selected event us
 existing CICIDS2017 attack graph. The GEXF graph is the primary investigation
 evidence; the event table supplies the underlying event metadata.
 
-Investigate the selected event's position in the graph. Use multi-hop graph
-traversal, shared-host relationships, explicit temporal edges, attack-type
-clusters, connected components, event records and structural paths. Explain
-which events and hosts are connected, which relations connect them, and whether
-the available graph actually supports a broader network-level incident.
+Treat the attack graph as the primary evidence and Isolation Forest only as
+secondary detector context. Perform a SOC-style investigation of the selected
+event's graph position: exact incoming/outgoing relations, source-host fan-out,
+destination-host fan-in, attack-type cluster composition, exact repeated
+source/destination/label tuples, explicit temporal predecessor/successor edges,
+and the event's connected component.
 
-Separate observed graph facts from hypotheses. Cite exact event IDs, node IDs,
-edge relations and timestamps. Only explicit edges whose relation is 'precedes'
-support temporal-order statements. Shared hosts or attack-type nodes alone do
-not prove one campaign or a confirmed incident. A source-to-destination path
-is structural connectivity, not proof of attacker movement or attack success.
+Do not merely list graph nodes or restate the anomaly score. Explain what the
+topology means operationally, what pattern is supported, what is not supported,
+and which analyst checks should resolve the remaining uncertainty. Distinguish
+a repeated same-source/same-destination pattern from multi-source activity.
+Use exact event IDs, node IDs, relation names, counts and timestamps. Only
+explicit 'precedes' edges support temporal-order claims. Shared hosts, common
+labels, transitive component membership and structural paths do not prove one
+campaign, attacker movement, or successful impact.
 
 CICIDS2017 provides network-flow evidence, not a complete identity or endpoint
 audit trail. Never invent authentication success/failure, user identity,
@@ -608,6 +612,234 @@ class AttackGraphInvestigationTools:
             arguments = {}
         return _json_safe(self._tool_map[name](**arguments))
 
+
+    def build_soc_assessment(self) -> dict[str, Any]:
+        """Derive an evidence-grounded SOC assessment from the graph topology."""
+        target_id = self.target_event_id
+        source_ip = str(self.target.get("src_ip", "unknown"))
+        destination_ip = str(self.target.get("dst_ip", "unknown"))
+        attack_type = str(self.target.get("attack_type", "unknown"))
+        source_node = f"host:{source_ip}"
+        destination_node = f"host:{destination_ip}"
+        attack_node = f"attack:{attack_type}"
+
+        def event_ids_from_nodes(nodes: Any) -> list[str]:
+            return sorted({
+                event_id for node in nodes
+                if (event_id := self._event_id(node)) is not None
+                and event_id in self.event_map
+            })
+
+        source_ids = event_ids_from_nodes(
+            self.graph.successors(source_node) if source_node in self.graph else []
+        )
+        destination_ids = event_ids_from_nodes(
+            self.graph.predecessors(destination_node) if destination_node in self.graph else []
+        )
+        attack_ids = event_ids_from_nodes(
+            self.graph.predecessors(attack_node) if attack_node in self.graph else []
+        )
+        exact_tuple_ids = sorted(set(source_ids) & set(destination_ids) & set(attack_ids))
+
+        def ordered_records(ids: list[str]) -> list[dict[str, Any]]:
+            records = [self.event_map[item] for item in ids if item in self.event_map]
+            return sorted(records, key=lambda item: (str(item.get("start_time") or ""), str(item.get("event_id") or "")))
+
+        def summarize_host(ids: list[str], role: str) -> dict[str, Any]:
+            records = ordered_records(ids)
+            peer_key = "dst_ip" if role == "source" else "src_ip"
+            peers = sorted({str(item.get(peer_key)) for item in records if item.get(peer_key) is not None})
+            labels: dict[str, int] = {}
+            for item in records:
+                label = str(item.get("attack_type", "unknown"))
+                labels[label] = labels.get(label, 0) + 1
+            times = [pd.to_datetime(item.get("start_time"), utc=True, errors="coerce") for item in records]
+            times = [stamp for stamp in times if not pd.isna(stamp)]
+            flow_total = 0
+            for item in records:
+                try:
+                    flow_total += int(float(item.get("flow_count") or 0))
+                except (TypeError, ValueError):
+                    pass
+            return {
+                "event_count": len(records),
+                "distinct_peer_host_count": len(peers),
+                "distinct_peer_hosts": peers[:20],
+                "attack_type_counts": labels,
+                "time_start": str(min(times)) if times else None,
+                "time_end": str(max(times)) if times else None,
+                "grouped_flow_record_total": flow_total,
+                "event_ids": [str(item.get("event_id")) for item in records[:30]],
+                "event_ids_truncated": len(records) > 30,
+            }
+
+        def summarize_cluster(ids: list[str]) -> dict[str, Any]:
+            records = ordered_records(ids)
+            sources = sorted({str(item.get("src_ip")) for item in records if item.get("src_ip") is not None})
+            destinations = sorted({str(item.get("dst_ip")) for item in records if item.get("dst_ip") is not None})
+            times = [pd.to_datetime(item.get("start_time"), utc=True, errors="coerce") for item in records]
+            times = [stamp for stamp in times if not pd.isna(stamp)]
+            return {
+                "event_count": len(records),
+                "distinct_source_count": len(sources),
+                "distinct_sources": sources[:20],
+                "distinct_destination_count": len(destinations),
+                "distinct_destinations": destinations[:20],
+                "time_start": str(min(times)) if times else None,
+                "time_end": str(max(times)) if times else None,
+                "event_ids": [str(item.get("event_id")) for item in records[:30]],
+                "event_ids_truncated": len(records) > 30,
+            }
+
+        incoming = []
+        for node in self.graph.predecessors(self.target_node):
+            attrs = dict(self.graph.edges[node, self.target_node])
+            incoming.append({"source": str(node), "relation": str(attrs.get("relation", "related"))})
+        outgoing = []
+        for node in self.graph.successors(self.target_node):
+            attrs = dict(self.graph.edges[self.target_node, node])
+            outgoing.append({"target": str(node), "relation": str(attrs.get("relation", "related"))})
+        incoming.sort(key=lambda row: (row["relation"], row["source"]))
+        outgoing.sort(key=lambda row: (row["relation"], row["target"]))
+
+        direct_predecessors = [
+            {"event_id": self._event_id(node), "gap_seconds": attrs.get("gap_seconds", attrs.get("time_gap_seconds"))}
+            for node, _, attrs in self.graph.in_edges(self.target_node, data=True)
+            if attrs.get("relation") == "precedes"
+        ]
+        direct_successors = [
+            {"event_id": self._event_id(node), "gap_seconds": attrs.get("gap_seconds", attrs.get("time_gap_seconds"))}
+            for _, node, attrs in self.graph.out_edges(self.target_node, data=True)
+            if attrs.get("relation") == "precedes"
+        ]
+        direct_predecessors.sort(key=lambda row: str(row.get("event_id")))
+        direct_successors.sort(key=lambda row: str(row.get("event_id")))
+
+        component = nx.node_connected_component(self.graph.to_undirected(), self.target_node)
+        component_event_ids = event_ids_from_nodes(component)
+        source_profile = summarize_host(source_ids, "source")
+        destination_profile = summarize_host(destination_ids, "destination")
+        attack_profile = summarize_cluster(attack_ids)
+        exact_profile = summarize_cluster(exact_tuple_ids)
+        temporal = self.trace_temporal_sequence()
+
+        findings = [
+            f"Selected node {self.target_node} has {len(incoming)} incoming and {len(outgoing)} outgoing directed graph edges.",
+            f"Source host {source_node} initiates {len(source_ids)} event node(s) and is linked to {source_profile['distinct_peer_host_count']} distinct destination host(s).",
+            f"Destination host {destination_node} is targeted by {len(destination_ids)} event node(s) from {destination_profile['distinct_peer_host_count']} distinct source host(s).",
+            f"Attack category node {attack_node} links {len(attack_ids)} event node(s), spanning {attack_profile['distinct_source_count']} source(s) and {attack_profile['distinct_destination_count']} destination(s). Category membership alone is not campaign evidence.",
+        ]
+        if len(exact_tuple_ids) > 1:
+            findings.append(
+                f"{len(exact_tuple_ids)} event node(s) share the exact source {source_ip}, destination {destination_ip}, and dataset label {attack_type!r}."
+            )
+        findings.append(
+            f"Direct explicit 'precedes' edges at the selected event: {len(direct_predecessors)} predecessor(s), {len(direct_successors)} successor(s)."
+        )
+        findings.append(
+            f"The undirected connected component contains {len(component_event_ids)} event node(s); transitive component membership is not a confirmed incident boundary."
+        )
+
+        if len(exact_tuple_ids) > 1:
+            summary = (
+                f"Graph assessment for {target_id}: {len(exact_tuple_ids)} event nodes share "
+                f"source {source_ip}, destination {destination_ip}, and category {attack_type!r}. "
+                "This supports a repeated single-source/single-destination traffic pattern. "
+                "The graph does not establish service impact or successful compromise."
+            )
+            confidence = "Strong for the repeated graph pattern; operational impact remains unverified."
+            hypothesis = {
+                "claim": f"Repeated {attack_type}-labelled activity between {source_ip} and {destination_ip} is represented by {len(exact_tuple_ids)} event nodes.",
+                "confidence": "Moderate for the traffic pattern; low for operational impact.",
+                "supporting_evidence": [
+                    f"{source_node} --initiates--> event nodes; those nodes --targets--> {destination_node}.",
+                    f"The event nodes connect to {attack_node} through 'classified_as' relations.",
+                    "Exact matching event IDs: " + ", ".join(exact_tuple_ids[:15]),
+                ],
+            }
+        elif attack_profile["distinct_source_count"] > 1:
+            summary = (
+                f"Graph assessment for {target_id}: the {attack_type!r} category cluster spans "
+                f"{attack_profile['distinct_source_count']} distinct source host(s) and "
+                f"{attack_profile['distinct_destination_count']} destination host(s). "
+                "This is a multi-source graph pattern requiring validation, not proof of coordination."
+            )
+            confidence = "Moderate for the graph distribution; coordination and impact remain unverified."
+            hypothesis = {
+                "claim": f"The {attack_type!r} category cluster contains events from {attack_profile['distinct_source_count']} distinct source hosts.",
+                "confidence": "Moderate for graph distribution; low for coordination.",
+                "supporting_evidence": [
+                    f"{attack_node} links {attack_profile['event_count']} event nodes.",
+                    "Source hosts: " + ", ".join(attack_profile["distinct_sources"][:15]),
+                    "Destination hosts: " + ", ".join(attack_profile["distinct_destinations"][:15]),
+                ],
+            }
+        else:
+            summary = (
+                f"Graph assessment for {target_id}: the selected event is connected to source "
+                f"{source_ip}, destination {destination_ip}, and category {attack_type!r}. "
+                f"The graph contains {len(exact_tuple_ids)} event(s) with this exact source/destination/category tuple."
+            )
+            confidence = "Limited; the selected event's local graph position is observable, but a broader pattern is not established."
+            hypothesis = {
+                "claim": "The selected event is a local graph observation; the supplied graph does not establish a broader exact-tuple pattern.",
+                "confidence": "Low.",
+                "supporting_evidence": [
+                    f"Exact source/destination/category tuple matches: {len(exact_tuple_ids)}.",
+                    f"Direct temporal predecessor/successor counts: {len(direct_predecessors)}/{len(direct_successors)}.",
+                ],
+            }
+
+        label = attack_type.lower()
+        if "dos" in label or "ddos" in label:
+            recommendations = [
+                f"Validate service impact on {destination_ip} over {attack_profile.get('time_start') or 'the observed window'} to {attack_profile.get('time_end') or 'the observed window'} using availability, CPU, connection-table and request-rate telemetry.",
+                f"Inspect raw flow records or packet capture between {source_ip} and {destination_ip} for TCP flags, connection churn and request rate; flow_count is not a packet count.",
+                f"Correlate firewall/IPS alerts and server access/error logs for {source_ip} and {destination_ip}; verify other source hosts before describing the activity as distributed.",
+            ]
+        elif "patator" in label or "brute force" in label:
+            recommendations = [
+                f"Correlate authentication logs on {destination_ip} with the graph-linked timestamps and source {source_ip}; distinguish failed attempts from successful sessions.",
+                "Inspect raw flow records for repeated connection patterns and destination service/port concentration.",
+                "Check identity and endpoint telemetry for account lockouts, successful logons and post-authentication activity; none is proven by this graph.",
+            ]
+        elif "portscan" in label:
+            recommendations = [
+                f"Inspect destination-port diversity and scan cadence from {source_ip} across the graph-linked destination hosts.",
+                "Correlate firewall and IDS records to determine which probes were blocked or answered.",
+                "Review service inventory and host logs for the targeted destinations; graph edges do not establish exploitable services.",
+            ]
+        else:
+            recommendations = [
+                f"Correlate raw flow records for {source_ip} and {destination_ip} with firewall/IDS telemetry over the graph-linked time window.",
+                "Inspect relevant endpoint and server logs to determine whether the network pattern produced an observable outcome.",
+                "Validate whether other graph-linked hosts and events share the same time window and behaviour before grouping them as one incident.",
+            ]
+
+        return {
+            "selected_event_node": self.target_node,
+            "executive_assessment": summary,
+            "graph_pattern_confidence": confidence,
+            "impact_status": "Not established by the supplied network-flow graph; service impact and endpoint outcomes are not encoded.",
+            "key_findings": findings,
+            "selected_event_relations": {"incoming": incoming, "outgoing": outgoing},
+            "source_host_profile": source_profile,
+            "destination_host_profile": destination_profile,
+            "attack_type_cluster_profile": attack_profile,
+            "exact_source_destination_label_cluster": exact_profile,
+            "direct_temporal_predecessors": direct_predecessors,
+            "direct_temporal_successors": direct_successors,
+            "temporal_sequence": temporal.get("sequence", []),
+            "connected_component": {
+                "event_count": len(component_event_ids),
+                "event_ids": component_event_ids[:40],
+                "event_ids_truncated": len(component_event_ids) > 40,
+                "interpretation": "An undirected component can join events transitively through shared host or attack-type nodes; it is not an incident boundary.",
+            },
+            "hypotheses": [hypothesis],
+            "recommended_investigations": recommendations,
+        }
+
     def deterministic_overview(self) -> dict[str, Any]:
         """Build baseline evidence from the existing graph before LLM planning."""
         return {
@@ -618,6 +850,7 @@ class AttackGraphInvestigationTools:
             "attack_type_cluster": self.summarize_attack_type_cluster(),
             "structural_paths": self.find_structural_paths(),
             "graph_metrics": self.summarize_graph_metrics(hops=3),
+            "soc_assessment": self.build_soc_assessment(),
         }
 
 
@@ -692,6 +925,15 @@ def run_agentic_graph_tools(
                 "temporal_edge_count": overview.get("temporal_sequence", {}).get("explicit_precedes_edges", 0),
                 "shared_host_relationship_count": overview.get("shared_host_events", {}).get("relationship_count", 0),
                 "attack_type_event_count": overview.get("attack_type_cluster", {}).get("event_count", 0),
+                "soc_assessment": {
+                    "executive_assessment": overview.get("soc_assessment", {}).get("executive_assessment"),
+                    "key_findings": overview.get("soc_assessment", {}).get("key_findings", [])[:6],
+                    "source_event_count": overview.get("soc_assessment", {}).get("source_host_profile", {}).get("event_count", 0),
+                    "destination_event_count": overview.get("soc_assessment", {}).get("destination_host_profile", {}).get("event_count", 0),
+                    "exact_tuple_event_count": overview.get("soc_assessment", {}).get("exact_source_destination_label_cluster", {}).get("event_count", 0),
+                    "attack_cluster_source_count": overview.get("soc_assessment", {}).get("attack_type_cluster_profile", {}).get("distinct_source_count", 0),
+                    "attack_cluster_destination_count": overview.get("soc_assessment", {}).get("attack_type_cluster_profile", {}).get("distinct_destination_count", 0),
+                },
             },
             "previous_findings": [
                 {
@@ -707,7 +949,9 @@ def run_agentic_graph_tools(
             "instructions": [
                 "Choose at most three tools from the allowlist.",
                 "Each tool must answer a specific unresolved investigation question.",
-                "Prefer graph relationships, temporal sequencing, connected components, attack-type clusters and structural path analysis as relevant.",
+                "Investigate the concrete pattern in soc_assessment: verify exact source/destination cohorts, label-cluster diversity, and direct precedes edges.",
+                "Use tool calls to resolve unanswered graph questions, not merely to repeat baseline counts.",
+                "Do not treat one connected component or one attack-type node as a confirmed incident.",
                 "Do not repeat an identical tool call.",
                 "Return JSON with tool_calls=[{name,arguments,purpose}] and continue_investigation (boolean).",
                 "Do not infer authentication, privilege escalation or data theft from network-flow labels.",
