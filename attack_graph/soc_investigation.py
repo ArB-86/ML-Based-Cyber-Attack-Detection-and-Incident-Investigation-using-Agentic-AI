@@ -847,6 +847,8 @@ class IncidentEvidenceTools:
             "end_time": item["end_time"],
             "event_ids": list(item["event_ids"]),
             "detection_reasons": list(item["detection_reasons"]),
+            "review_reasons": list(item.get("review_reasons", [])),
+            "context_signals": list(item.get("context_signals", [])),
             "triage": dict(item["triage"]),
             "graph_analysis": dict(item["graph_analysis"]),
             "attack_hypotheses": list(item.get("attack_hypotheses", [])),
@@ -906,6 +908,8 @@ class IncidentEvidenceTools:
     def get_detection_evidence(self, incident_id: str) -> dict[str, Any]:
         timeline = self.get_timeline(incident_id)
         by_reason: dict[str, list[str]] = {}
+        by_review: dict[str, list[str]] = {}
+        by_context: dict[str, list[str]] = {}
         by_source: dict[str, list[str]] = {}
         for event in timeline:
             event_id = str(event["event_id"])
@@ -913,12 +917,22 @@ class IncidentEvidenceTools:
                 reason = reason.strip()
                 if reason:
                     by_reason.setdefault(reason, []).append(event_id)
+            for reason in str(event.get("review_reasons", "")).split(";"):
+                reason = reason.strip()
+                if reason:
+                    by_review.setdefault(reason, []).append(event_id)
+            for signal in str(event.get("context_signals", "")).split(";"):
+                signal = signal.strip()
+                if signal:
+                    by_context.setdefault(signal, []).append(event_id)
             for source in str(event.get("alert_sources", "")).split(";"):
                 source = source.strip()
                 if source:
                     by_source.setdefault(source, []).append(event_id)
         return {
             "reason_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_reason.items())},
+            "review_reason_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_review.items())},
+            "context_signal_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_context.items())},
             "source_to_event_ids": {key: sorted(set(value)) for key, value in sorted(by_source.items())},
         }
 
@@ -1605,6 +1619,10 @@ def run_soc_investigation_from_events(
         raise ValueError("Event contract contains missing endpoint or protocol values.")
     if "detection_reasons" not in events.columns:
         events["detection_reasons"] = "LEGACY_EVENT_IMPORT"
+    if "review_reasons" not in events.columns:
+        events["review_reasons"] = ""
+    if "context_signals" not in events.columns:
+        events["context_signals"] = ""
     if "alert_sources" not in events.columns:
         events["alert_sources"] = "LEGACY_EVENT_IMPORT"
     if "attack_type" not in events.columns:
@@ -1737,8 +1755,11 @@ def run_soc_investigation_from_events(
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
             "agent_tool_calls": tool_call_count,
+            "review_only_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("review_only_flows", 0),
+            "context_signal_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("context_signal_flows", 0),
         },
         "artifacts": [
+            "review_candidates_with_metadata.csv",
             "attack_events.csv",
             "event_correlations.csv",
             "attack_graph.gexf",
