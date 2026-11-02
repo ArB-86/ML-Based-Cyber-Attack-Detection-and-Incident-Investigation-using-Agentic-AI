@@ -602,6 +602,7 @@ def run(
     benchmark_parquet: str | None = None,
     verify_only: bool = False,
     reasoner=None,
+    max_agent_investigations: int | None = None,
 ) -> None:
     start = time.time()
 
@@ -777,6 +778,7 @@ def run(
         out,
         reasoner=reasoner,
         pipeline_context=pipeline_context,
+        max_agent_investigations=max_agent_investigations,
     )
 
     # The SOC orchestrator owns graph persistence after incident nodes and
@@ -888,6 +890,7 @@ def run_from_predictions(
     predictions_path: str,
     output_dir: str,
     reasoner=None,
+    max_agent_investigations: int | None = None,
 ) -> dict:
     """Replay detector policy and SOC investigation using saved model scores.
 
@@ -987,6 +990,7 @@ def run_from_predictions(
         out,
         reasoner=reasoner,
         pipeline_context=pipeline_context,
+        max_agent_investigations=max_agent_investigations,
     )
     gexf_path = out / "attack_graph.gexf"
     if not gexf_path.exists() or gexf_path.stat().st_size == 0:
