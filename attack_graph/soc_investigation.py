@@ -1270,13 +1270,17 @@ class IncidentEvidenceTools:
 
 
 class AgenticInvestigationAgent:
-    """Execute a fixed evidence plan plus one bounded LLM-directed tool round.
+    """Run deterministic evidence collection and bounded iterative LLM tool use.
 
     The optional reasoner receives evidence and a read-only tool catalogue. It
-    may return plain text or a structured dictionary with tool_calls, findings
-    and narrative. Only allowlisted tools and incident-scoped event IDs can be
-    used. No arbitrary code or host actions are exposed to the model.
+    may request up to two incident-scoped tool rounds. Only allowlisted tools
+    and event IDs inside the current incident can be used; no arbitrary code
+    or host actions are exposed to the model.
     """
+
+    MAX_LLM_TOOL_ROUNDS = 2
+    MAX_LLM_TOOL_CALLS = 8
+    MAX_LLM_TOOLS_PER_ROUND = 5
 
     TOOL_CATALOG = [
         {
@@ -1437,10 +1441,64 @@ class AgenticInvestigationAgent:
         model_response: dict[str, Any] = {}
 
         reasoner_error = None
+        reasoner_calls: list[dict[str, Any]] = []
+        llm_tool_rounds = 0
+        llm_tool_requests = 0
+        llm_tool_calls_executed = 0
+        model_response: dict[str, Any] = {}
+
         if self.reasoner is not None:
-            first_response: dict[str, Any] = {}
-            try:
-                first_response = self._decode_reasoner_response(self.reasoner({
+            def invoke_reasoner(
+                context: dict[str, Any],
+                *,
+                phase: str,
+                round_number: int,
+            ) -> dict[str, Any] | None:
+                nonlocal reasoner_error
+                try:
+                    response = self._decode_reasoner_response(self.reasoner(context))
+                    requested = response.get("tool_calls", [])
+                    reasoner_calls.append({
+                        "phase": phase,
+                        "round": round_number,
+                        "status": "success",
+                        "requested_tool_count": (
+                            len(requested) if isinstance(requested, list) else 0
+                        ),
+                        "response_keys": sorted(str(key) for key in response),
+                    })
+                    return response
+                except Exception as exc:
+                    reasoner_error = f"{type(exc).__name__}: {exc}"
+                    reasoner_calls.append({
+                        "phase": phase,
+                        "round": round_number,
+                        "status": "error",
+                        "error": reasoner_error,
+                    })
+                    trace.append({
+                        "tool": "reasoner",
+                        "status": "error",
+                        "error": reasoner_error,
+                        "evidence_refs": [],
+                    })
+                    return None
+
+            def reject_tool_request(
+                name: Any,
+                arguments: Any,
+                error: str,
+            ) -> None:
+                trace.append({
+                    "tool": str(name),
+                    "arguments": arguments if isinstance(arguments, dict) else {},
+                    "status": "rejected",
+                    "error": error,
+                    "evidence_refs": [],
+                })
+
+            initial_response = invoke_reasoner(
+                {
                     "task": (
                         "Act as a SOC analyst. Inspect the supplied evidence, identify what is "
                         "still unknown, and request only relevant read-only tools. Do not assert "
@@ -1465,137 +1523,303 @@ class AgenticInvestigationAgent:
                         }],
                         "narrative": "string",
                     },
-                }))
-            except Exception as exc:
-                reasoner_error = f"{type(exc).__name__}: {exc}"
-                trace.append({
-                    "tool": "reasoner",
-                    "status": "error",
-                    "error": reasoner_error,
-                    "evidence_refs": [],
-                })
+                },
+                phase="initial_plan",
+                round_number=0,
+            )
 
-            model_response = first_response
-            requested_tools = first_response.get("tool_calls", [])
-            if not isinstance(requested_tools, list):
-                requested_tools = []
+            if initial_response is not None:
+                model_response = initial_response
+                allowed_event_ids = set(incident["event_ids"])
+                allowed_arguments = {
+                    "get_event": {"event_id"},
+                    "get_host_activity": {"host_ip"},
+                    "get_service_activity": {"destination_port", "protocol"},
+                    "get_correlated_events": {"event_id", "relation_contains"},
+                }
+                required_arguments = {
+                    "get_event": {"event_id"},
+                    "get_host_activity": {"host_ip"},
+                    "get_service_activity": {"destination_port"},
+                    "get_correlated_events": set(),
+                }
+                all_tool_results: list[dict[str, Any]] = []
 
-            tool_results = []
-            allowed_event_ids = set(incident["event_ids"])
-            allowed_arguments = {
-                "get_event": {"event_id"},
-                "get_host_activity": {"host_ip"},
-                "get_service_activity": {"destination_port", "protocol"},
-                "get_correlated_events": {"event_id", "relation_contains"},
-            }
-            for request in requested_tools[:5]:
-                if not isinstance(request, dict):
-                    continue
-                name = request.get("name", request.get("tool"))
-                arguments = request.get("arguments", {})
-                if (
-                    not isinstance(name, str)
-                    or name not in self.available_tools
-                    or not isinstance(arguments, dict)
-                ):
-                    trace.append({
-                        "tool": str(name),
-                        "status": "rejected",
-                        "error": "Tool is not allowlisted or arguments are invalid.",
-                        "evidence_refs": [],
-                    })
-                    continue
+                for round_number in range(1, self.MAX_LLM_TOOL_ROUNDS + 1):
+                    requested_tools = model_response.get("tool_calls", [])
+                    if not isinstance(requested_tools, list):
+                        if "tool_calls" in model_response:
+                            reject_tool_request(
+                                "reasoner_response",
+                                {},
+                                "tool_calls must be a JSON array.",
+                            )
+                        requested_tools = []
+                    if not requested_tools:
+                        break
 
-                arguments = dict(arguments)
-                requested_incident = arguments.pop("incident_id", incident_id)
-                if requested_incident != incident_id:
-                    trace.append({
-                        "tool": name,
-                        "status": "rejected",
-                        "error": "Cross-incident tool access is not permitted.",
-                        "evidence_refs": [],
-                    })
-                    continue
-                unexpected = set(arguments) - allowed_arguments[name]
-                if unexpected:
-                    trace.append({
-                        "tool": name,
-                        "arguments": arguments,
-                        "status": "rejected",
-                        "error": f"Unexpected tool arguments: {sorted(unexpected)}",
-                        "evidence_refs": [],
-                    })
-                    continue
-                if name == "get_event":
-                    requested_id = str(arguments.get("event_id", ""))
-                    if requested_id not in allowed_event_ids:
-                        trace.append({
-                            "tool": name,
-                            "arguments": arguments,
-                            "status": "rejected",
-                            "error": "Event is outside this incident's scope.",
-                            "evidence_refs": [],
-                        })
+                    llm_tool_rounds += 1
+                    remaining_budget = self.MAX_LLM_TOOL_CALLS - llm_tool_requests
+                    if remaining_budget <= 0:
+                        reject_tool_request(
+                            "llm_tool_budget",
+                            {},
+                            "Maximum LLM-directed tool-call budget reached.",
+                        )
+                        break
+
+                    round_results: list[dict[str, Any]] = []
+                    allowed_this_round = min(
+                        self.MAX_LLM_TOOLS_PER_ROUND,
+                        remaining_budget,
+                    )
+
+                    for request in requested_tools[:allowed_this_round]:
+                        llm_tool_requests += 1
+
+                        if not isinstance(request, dict):
+                            reject_tool_request(
+                                "unknown",
+                                {},
+                                "Tool request must be a JSON object.",
+                            )
+                            continue
+
+                        name = request.get("name", request.get("tool"))
+                        arguments = request.get("arguments", {})
+                        if (
+                            not isinstance(name, str)
+                            or name not in self.available_tools
+                            or not isinstance(arguments, dict)
+                        ):
+                            reject_tool_request(
+                                name,
+                                arguments,
+                                "Tool is not allowlisted or arguments are invalid.",
+                            )
+                            continue
+
+                        arguments = dict(arguments)
+                        requested_incident = arguments.pop("incident_id", incident_id)
+                        if requested_incident != incident_id:
+                            reject_tool_request(
+                                name,
+                                arguments,
+                                "Cross-incident tool access is not permitted.",
+                            )
+                            continue
+
+                        unexpected = set(arguments) - allowed_arguments[name]
+                        missing = required_arguments[name] - set(arguments)
+                        if unexpected or missing:
+                            reject_tool_request(
+                                name,
+                                arguments,
+                                (
+                                    f"Unexpected arguments: {sorted(unexpected)}; "
+                                    f"missing required arguments: {sorted(missing)}."
+                                ),
+                            )
+                            continue
+
+                        if name == "get_event":
+                            requested_id = str(arguments.get("event_id", ""))
+                            if requested_id not in allowed_event_ids:
+                                reject_tool_request(
+                                    name,
+                                    arguments,
+                                    "Event is outside this incident's scope.",
+                                )
+                                continue
+                            arguments["event_id"] = requested_id
+
+                        elif name == "get_host_activity":
+                            host_ip = arguments.get("host_ip")
+                            if not isinstance(host_ip, str) or not host_ip.strip():
+                                reject_tool_request(
+                                    name, arguments, "host_ip must be a non-empty string."
+                                )
+                                continue
+                            arguments["host_ip"] = host_ip.strip()
+
+                        elif name == "get_service_activity":
+                            port = arguments.get("destination_port")
+                            if isinstance(port, bool):
+                                reject_tool_request(
+                                    name, arguments, "destination_port must be an integer."
+                                )
+                                continue
+                            try:
+                                parsed_port = int(port)
+                            except (TypeError, ValueError):
+                                reject_tool_request(
+                                    name, arguments, "destination_port must be an integer."
+                                )
+                                continue
+                            if str(parsed_port) != str(port).strip() or not 0 <= parsed_port <= 65535:
+                                reject_tool_request(
+                                    name,
+                                    arguments,
+                                    "destination_port must be an integer from 0 to 65535.",
+                                )
+                                continue
+                            arguments["destination_port"] = parsed_port
+                            protocol = arguments.get("protocol")
+                            if protocol is not None and not isinstance(protocol, str):
+                                reject_tool_request(
+                                    name, arguments, "protocol must be a string or null."
+                                )
+                                continue
+
+                        elif name == "get_correlated_events":
+                            requested_id = arguments.get("event_id")
+                            if requested_id is not None:
+                                requested_id = str(requested_id)
+                                if requested_id not in allowed_event_ids:
+                                    reject_tool_request(
+                                        name,
+                                        arguments,
+                                        "Event is outside this incident's scope.",
+                                    )
+                                    continue
+                                arguments["event_id"] = requested_id
+                            relation = arguments.get("relation_contains")
+                            if relation is not None and not isinstance(relation, str):
+                                reject_tool_request(
+                                    name,
+                                    arguments,
+                                    "relation_contains must be a string or null.",
+                                )
+                                continue
+
+                        # Never trust an incident ID supplied by the model.
+                        arguments["incident_id"] = incident_id
+                        result = self._record_call(
+                            trace, name, arguments, self.available_tools[name]
+                        )
+                        if result is not None:
+                            llm_tool_calls_executed += 1
+                            round_results.append({
+                                "tool": name,
+                                "arguments": arguments,
+                                "result": result,
+                            })
+
+                    deferred_requests = len(requested_tools) - allowed_this_round
+                    if deferred_requests > 0:
+                        reject_tool_request(
+                            "llm_tool_budget",
+                            {"deferred_requests": deferred_requests},
+                            "Remaining LLM-directed tool-call budget was exhausted; requests were not executed.",
+                        )
+
+                    if not round_results:
+                        break
+
+                    all_tool_results.extend(round_results)
+
+                    if round_number < self.MAX_LLM_TOOL_ROUNDS:
+                        next_response = invoke_reasoner(
+                            {
+                                "task": (
+                                    "Continue the SOC investigation using the initial evidence and all "
+                                    "completed tool results. Identify remaining evidence gaps. Request "
+                                    "only additional relevant allowlisted read-only tools; otherwise "
+                                    "return final JSON with tool_calls as an empty array, findings and "
+                                    "narrative. Do not infer compromise from flow metadata alone."
+                                ),
+                                "incident": incident,
+                                "initial_evidence": {
+                                    "timeline": timeline,
+                                    "graph": graph,
+                                    "detections": detections,
+                                },
+                                "deterministic_findings": claims,
+                                "tool_catalog": self.TOOL_CATALOG,
+                                "completed_tool_results": all_tool_results,
+                                "round": round_number,
+                                "remaining_tool_call_budget": (
+                                    self.MAX_LLM_TOOL_CALLS - llm_tool_requests
+                                ),
+                            },
+                            phase="tool_followup",
+                            round_number=round_number,
+                        )
+                        if next_response is None:
+                            break
+                        model_response = next_response
                         continue
-                else:
-                    # Never trust an incident ID supplied by the model.
-                    arguments["incident_id"] = incident_id
 
-                result = self._record_call(
-                    trace, name, arguments, self.available_tools[name]
-                )
-                if result is not None:
-                    tool_results.append({
-                        "tool": name,
-                        "arguments": arguments,
-                        "result": result,
-                    })
-
-            if tool_results:
-                try:
-                    model_response = self._decode_reasoner_response(self.reasoner({
-                        "task": (
-                            "Complete the SOC investigation using only this evidence. Return a concise "
-                            "incident explanation, findings with exact event IDs, uncertainty/caveats, "
-                            "and recommended analyst actions. Do not invent users, process execution, "
-                            "successful logins, exfiltration or business impact."
-                        ),
-                        "incident": incident,
-                        "initial_evidence": {
-                            "timeline": timeline,
-                            "graph": graph,
-                            "detections": detections,
+                    final_response = invoke_reasoner(
+                        {
+                            "task": (
+                                "Provide the final SOC investigation synthesis using only the supplied "
+                                "incident evidence and completed tool results. No more tools are available. "
+                                "Return JSON with an empty tool_calls array, findings with exact event IDs, "
+                                "a concise narrative, uncertainty/caveats and recommended analyst actions. "
+                                "Do not invent users, process execution, successful logins, exfiltration "
+                                "or business impact."
+                            ),
+                            "incident": incident,
+                            "initial_evidence": {
+                                "timeline": timeline,
+                                "graph": graph,
+                                "detections": detections,
+                            },
+                            "deterministic_findings": claims,
+                            "completed_tool_results": all_tool_results,
+                            "response_contract": {
+                                "tool_calls": [],
+                                "findings": [{
+                                    "claim": "string",
+                                    "evidence_event_ids": ["event id"],
+                                    "confidence": "low|medium|high",
+                                }],
+                                "narrative": "string",
+                            },
                         },
-                        "deterministic_findings": claims,
-                        "additional_tool_results": tool_results,
-                    }))
-                except Exception as exc:
-                    reasoner_error = f"{type(exc).__name__}: {exc}"
-                    trace.append({
-                        "tool": "reasoner_final_synthesis",
-                        "status": "error",
-                        "error": reasoner_error,
-                        "evidence_refs": [],
-                    })
-                    model_response = first_response
+                        phase="final_synthesis",
+                        round_number=round_number,
+                    )
+                    if final_response is not None:
+                        if final_response.get("tool_calls"):
+                            reject_tool_request(
+                                "final_synthesis_tool_request",
+                                {},
+                                "Tool requests are disabled during final synthesis.",
+                            )
+                        model_response = final_response
+                    break
 
-            if model_response.get("narrative"):
-                narrative = str(model_response["narrative"])
             preliminary = model_response.get(
                 "findings",
                 model_response.get(
                     "preliminary_findings",
-                    first_response.get("preliminary_findings", []),
+                    initial_response.get("preliminary_findings", [])
+                    if initial_response is not None else [],
                 ),
             )
             if isinstance(preliminary, list):
                 for finding in preliminary:
                     if not isinstance(finding, dict):
                         continue
-                    event_refs = [
-                        str(value) for value in finding.get("evidence_event_ids", [])
-                    ]
-                    claim_text = str(finding.get("claim", finding.get("finding", ""))).strip()
+                    raw_event_refs = finding.get("evidence_event_ids", [])
+                    if isinstance(raw_event_refs, str):
+                        raw_event_refs = [raw_event_refs]
+                    if not isinstance(raw_event_refs, (list, tuple, set)):
+                        raw_event_refs = []
+                    event_refs = list(dict.fromkeys(
+                        str(value).strip()
+                        for value in raw_event_refs
+                        if str(value).strip()
+                    ))
+                    claim_text = str(
+                        finding.get("claim", finding.get("finding", ""))
+                    ).strip()
+                    confidence = str(finding.get("confidence", "low")).lower()
+                    if confidence not in {"low", "medium", "high"}:
+                        confidence = "low"
+
                     if (
                         claim_text
                         and event_refs
@@ -1605,8 +1829,11 @@ class AgenticInvestigationAgent:
                             "claim": claim_text,
                             "evidence_event_ids": event_refs,
                             "evidence_edges": [],
-                            "confidence": str(finding.get("confidence", "low")).lower(),
+                            "confidence": confidence,
                             "source": "llm_evidence_validated",
+                            "validation_scope": "event_id_membership_only",
+                            "claim_semantics_independently_verified": False,
+                            "analyst_validation_required": True,
                         })
                     else:
                         trace.append({
@@ -1630,6 +1857,10 @@ class AgenticInvestigationAgent:
                 else "tool_assisted_llm"
             ),
             "reasoner_error": reasoner_error,
+            "reasoner_calls": reasoner_calls,
+            "llm_tool_rounds": llm_tool_rounds,
+            "llm_tool_requests": llm_tool_requests,
+            "llm_tool_calls_executed": llm_tool_calls_executed,
             "status": "completed",
             "plan": [
                 "retrieve_incident_context",
@@ -1821,6 +2052,9 @@ def _write_report(incidents: list[dict[str, Any]], events: pd.DataFrame, graph: 
             "**Tool-assisted agent investigation:**",
             f"- Mode: {investigation.get('mode', 'not run')}",
             f"- Tools executed: {len(investigation.get('tool_calls', []))}",
+            f"- Reasoner calls: {len(investigation.get('reasoner_calls', []))}",
+            f"- LLM-directed tool rounds: {investigation.get('llm_tool_rounds', 0)}",
+            f"- LLM-directed tools executed: {investigation.get('llm_tool_calls_executed', 0)}",
             f"- Evidence-linked findings: {len(investigation.get('findings', []))}",
         ])
         if investigation.get("narrative"):
@@ -2018,6 +2252,18 @@ def run_soc_investigation_from_events(
         len(item.get("investigation_agent", {}).get("tool_calls", []))
         for item in incidents
     )
+    reasoner_call_count = sum(
+        len(item.get("investigation_agent", {}).get("reasoner_calls", []))
+        for item in incidents
+    )
+    llm_tool_round_count = sum(
+        int(item.get("investigation_agent", {}).get("llm_tool_rounds", 0))
+        for item in incidents
+    )
+    llm_tool_execution_count = sum(
+        int(item.get("investigation_agent", {}).get("llm_tool_calls_executed", 0))
+        for item in incidents
+    )
     manifest = {
         "pipeline": "cicids2017_soc_incident_investigation",
         "version": "1.0",
@@ -2032,7 +2278,13 @@ def run_soc_investigation_from_events(
             {"name": "incident_formation", "status": "completed", "output": "incident_investigation.json"},
             {"name": "attack_graph_construction", "status": "completed", "output": "attack_graph.gexf"},
             {"name": "risk_assessment", "status": "completed", "output": "incident_investigation.json"},
-            {"name": "agentic_investigation", "status": "completed", "tool_calls": tool_call_count},
+            {
+                "name": "agentic_investigation",
+                "status": "completed",
+                "tool_calls": tool_call_count,
+                "reasoner_calls": reasoner_call_count,
+                "llm_tool_rounds": llm_tool_round_count,
+            },
             {"name": "evidence_backed_reporting", "status": "completed", "output": "incident_investigation_report.md"},
         ],
         "pipeline_context": pipeline_context or {},
@@ -2064,6 +2316,9 @@ def run_soc_investigation_from_events(
             "graph_nodes": graph.number_of_nodes(),
             "graph_edges": graph.number_of_edges(),
             "agent_tool_calls": tool_call_count,
+            "agent_reasoner_calls": reasoner_call_count,
+            "llm_tool_rounds": llm_tool_round_count,
+            "llm_tool_calls_executed": llm_tool_execution_count,
             "review_only_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("review_only_flows", 0),
             "context_signal_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("context_signal_flows", 0),
         },
@@ -2093,6 +2348,9 @@ def run_soc_investigation_from_events(
         "graph_event_links": sum(i["graph_analysis"]["graph_event_links"] for i in incidents),
         "correlation_count": len(correlations),
         "agent_tool_calls": tool_call_count,
+        "agent_reasoner_calls": reasoner_call_count,
+        "llm_tool_rounds": llm_tool_round_count,
+        "llm_tool_calls_executed": llm_tool_execution_count,
         "event_count": len(events),
         "graph_nodes": graph.number_of_nodes(),
         "graph_edges": graph.number_of_edges(),
