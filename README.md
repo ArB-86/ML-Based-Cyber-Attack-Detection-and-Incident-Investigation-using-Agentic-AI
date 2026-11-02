@@ -92,9 +92,9 @@ The priority score combines detection-rule diversity, event persistence, source 
 
 ### Tool-driven investigation
 
-`AgenticInvestigationAgent` first retrieves the incident, chronological timeline, graph neighbourhood and detector provenance. It then exposes a bounded read-only tool registry: `get_event`, `get_host_activity`, `get_service_activity` and `get_correlated_events`. A reasoner can select up to five additional tools in one round. Every call records arguments, result summaries, status and event references. Model findings are accepted only when they cite event IDs inside the current incident; unsupported or cross-incident claims are rejected.
+`AgenticInvestigationAgent` first retrieves the incident, chronological timeline, graph neighbourhood and detector provenance. It then exposes a bounded read-only tool registry: `get_event`, `get_host_activity`, `get_service_activity` and `get_correlated_events`. A reasoner can select tools across at most two iterative rounds, with a total budget of eight requests and five requests per round, followed by final synthesis when the round limit is reached. Reasoner invocations and tool executions are traced separately. Model findings are only event-ID-scope validated; this does not independently prove claim semantics, so analyst validation remains mandatory.
 
-The default mode is a deterministic, tool-assisted baseline. The existing local LLM/Ollama reasoner can be passed as a Python callback in `PipelineConfig(reasoner=...)`; the callback receives an evidence bundle and tool catalogue, and should return structured JSON containing `tool_calls`, `findings` and `narrative` to enable model-directed tool use. Plain text responses are treated as narrative-only. This keeps your model/server/runtime configuration separate from the SOC orchestration code. No Ollama server/model settings are changed by this refactor.
+The default mode is a deterministic, tool-assisted baseline. The existing local LLM/Ollama reasoner can be passed as a Python callback in `PipelineConfig(reasoner=...)`; the callback receives an evidence bundle and tool catalogue, and should return structured JSON containing `tool_calls`, `findings` and `narrative` to enable model-directed tool use. Plain text responses are treated as narrative-only. The canonical CLI can import the existing callback using `--reasoner-callable module:function`. This keeps model/server/runtime configuration separate from the SOC orchestration code. No Ollama server/model settings are changed by this refactor.
 
 To run the canonical dataset pipeline with the reasoner function you already use for Ollama, pass that existing callable to the configuration instead of starting a second workflow:
 
@@ -105,7 +105,11 @@ To run the canonical dataset pipeline with the reasoner function you already use
         reasoner=your_existing_ollama_reasoner,
     ))
 
-The callback contract is `reasoner(context: dict) -> str | dict`. For model-directed tool use, return a dictionary with `tool_calls` (up to five allowlisted calls), `findings` (each with valid `evidence_event_ids`) and `narrative`. A plain string is accepted as narrative-only.
+Or use the CLI with the module/function that already contains your configured callback:
+
+    python -m attack_graph.pipeline --reuse-predictions "soc_output\cicids_if_predictions_with_metadata.csv" --output-dir "soc_output_llm_smoke" --reasoner-callable your_reasoner_module:your_existing_ollama_reasoner
+
+The callback contract is `reasoner(context: dict) -> str | dict`. For model-directed tool use, return a dictionary with `tool_calls` (up to five allowlisted calls per round; eight total across at most two tool rounds), `findings` (each with valid `evidence_event_ids`) and `narrative`. A plain string is accepted as narrative-only. Accepted findings record that validation checks incident event-ID membership only; factual claim semantics are not independently verified.
 
 ## Output artefacts
 
