@@ -107,7 +107,9 @@ To run the canonical dataset pipeline with the reasoner function you already use
 
 Or use the CLI with the module/function that already contains your configured callback:
 
-    python -m attack_graph.pipeline --reuse-predictions "soc_output\cicids_if_predictions_with_metadata.csv" --output-dir "soc_output_llm_smoke" --reasoner-callable your_reasoner_module:your_existing_ollama_reasoner
+    python -m attack_graph.pipeline --reuse-predictions "soc_output\cicids_if_predictions_with_metadata.csv" --output-dir "soc_output_llm_smoke" --reasoner-callable your_reasoner_module:your_existing_ollama_reasoner --max-agent-investigations 1
+
+The diagnostic limit runs the investigation agent only for the first N prioritised candidate incidents; remaining candidates stay in the output and are explicitly marked `skipped_by_limit`. Use `--max-agent-investigations 1` for a safe first Ollama smoke test. Omit the flag for the normal full run.
 
 The callback contract is `reasoner(context: dict) -> str | dict`. For model-directed tool use, return a dictionary with `tool_calls` (up to five allowlisted calls per round; eight total across at most two tool rounds), `findings` (each with valid `evidence_event_ids`) and `narrative`. A plain string is accepted as narrative-only. Accepted findings record that validation checks incident event-ID membership only; factual claim semantics are not independently verified.
 
