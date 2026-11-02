@@ -38,7 +38,7 @@ def load_reasoner_callable(spec: str | None) -> Callable[[dict[str, Any]], str |
     module_name, separator, attribute_name = spec.strip().partition(":")
     if not separator or not module_name.strip() or not attribute_name.strip():
         raise ValueError(
-            "Invalid --reasoner-callable. Expected an import path like my_module:reasoner."
+            "Invalid --reasoner-callable. Expected module:callable format, e.g. my_module:reasoner."
         )
     module = importlib.import_module(module_name.strip())
     callback: Any = module
