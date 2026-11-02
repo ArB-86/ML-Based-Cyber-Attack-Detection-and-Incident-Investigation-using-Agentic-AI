@@ -328,6 +328,93 @@ def test_reasoner_callable_loader_rejects_invalid_targets(monkeypatch):
         load_reasoner_callable("reasoner_without_callable:value")
 
 
+def test_agent_investigation_limit_runs_one_llm_incident_and_marks_rest_skipped(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.01,
+        },
+        {
+            "timestamp": _time(1), "src_ip": "A", "dst_ip": "C", "protocol": 6,
+            "src_port": 50001, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.02,
+        },
+        {
+            "timestamp": _time(10), "src_ip": "X", "dst_ip": "Y", "protocol": 6,
+            "src_port": 51000, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.03,
+        },
+        {
+            "timestamp": _time(11), "src_ip": "X", "dst_ip": "Z", "protocol": 6,
+            "src_port": 51001, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.04,
+        },
+    ])
+
+    reasoner_calls = []
+
+    def fake_reasoner(context):
+        reasoner_calls.append(context)
+        return {
+            "tool_calls": [],
+            "findings": [],
+            "narrative": "Single-incident smoke-test response.",
+        }
+
+    _, _, summary = run_soc_investigation(
+        flows,
+        tmp_path,
+        reasoner=fake_reasoner,
+        max_agent_investigations=1,
+    )
+
+    payload = json.loads(
+        (tmp_path / "incident_investigation.json").read_text()
+    )
+    agents = [
+        incident["investigation_agent"]
+        for incident in payload["incidents"]
+    ]
+
+    assert summary["incident_count"] == 2
+    assert summary["agent_investigations_executed"] == 1
+    assert summary["agent_investigations_skipped"] == 1
+    assert summary["reasoner_incidents"] == 1
+    assert len(reasoner_calls) == 1
+    assert sum(agent["mode"] == "tool_assisted_llm" for agent in agents) == 1
+    assert sum(agent["mode"] == "not_run_limit" for agent in agents) == 1
+    assert sum(agent["status"] == "skipped_by_limit" for agent in agents) == 1
+    assert all(
+        agent["reasoner_skipped_by_limit"]
+        for agent in agents if agent["mode"] == "not_run_limit"
+    )
+
+
+def test_agent_investigation_limit_rejects_negative_values(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 22, "alert": True,
+            "detection_reasons": "BRUTE_FORCE_PATTERN",
+            "alert_sources": "BEHAVIOURAL_RULE", "anomaly_score": 0.01,
+        },
+    ])
+
+    import pytest
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        run_soc_investigation(
+            flows,
+            tmp_path,
+            max_agent_investigations=-1,
+        )
+
+
 def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
     flows = pd.DataFrame([
         {
