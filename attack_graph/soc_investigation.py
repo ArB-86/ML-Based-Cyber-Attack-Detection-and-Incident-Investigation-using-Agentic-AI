@@ -2094,8 +2094,9 @@ def run_soc_investigation(
     *,
     reasoner=None,
     pipeline_context: dict[str, Any] | None = None,
+    max_agent_investigations: int | None = None,
 ) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
-    """Run correlation -> incident formation -> graph -> risk -> agent tools -> report."""
+    """Run the SOC workflow, optionally limiting agent investigations for smoke tests."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     events = build_soc_events(alert_flows)
@@ -2105,6 +2106,7 @@ def run_soc_investigation(
         reasoner=reasoner,
         alert_flow_count=len(alert_flows),
         pipeline_context=pipeline_context,
+        max_agent_investigations=max_agent_investigations,
     )
 
 
@@ -2115,8 +2117,12 @@ def run_soc_investigation_from_events(
     reasoner=None,
     alert_flow_count: int | None = None,
     pipeline_context: dict[str, Any] | None = None,
+    max_agent_investigations: int | None = None,
 ) -> tuple[pd.DataFrame, nx.DiGraph, dict[str, Any]]:
     """Continue the canonical workflow from an already-formed event table."""
+    if max_agent_investigations is not None:
+        if isinstance(max_agent_investigations, bool) or not isinstance(max_agent_investigations, int) or max_agent_investigations < 0:
+            raise ValueError("max_agent_investigations must be a non-negative integer or None.")
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     events = events.copy()
@@ -2192,9 +2198,52 @@ def run_soc_investigation_from_events(
     unassigned_event_count = len(all_event_ids - assigned_event_ids)
 
     evidence_tools = IncidentEvidenceTools(incidents, events, graph)
-    agent = AgenticInvestigationAgent(evidence_tools, reasoner=reasoner)
-    for incident in incidents:
-        investigation = agent.investigate(incident["incident_id"])
+    deterministic_agent = AgenticInvestigationAgent(evidence_tools, reasoner=None)
+    llm_agent = (
+        AgenticInvestigationAgent(evidence_tools, reasoner=reasoner)
+        if reasoner is not None else None
+    )
+    executed_agent_investigations = 0
+    skipped_agent_investigations = 0
+    for incident_index, incident in enumerate(incidents):
+        within_limit = (
+            max_agent_investigations is None
+            or incident_index < max_agent_investigations
+        )
+        if not within_limit:
+            skipped_agent_investigations += 1
+            investigation = {
+                "agent": "AgenticInvestigationAgent",
+                "mode": "not_run_limit",
+                "status": "skipped_by_limit",
+                "reasoner_error": None,
+                "reasoner_calls": [],
+                "llm_tool_rounds": 0,
+                "llm_tool_requests": 0,
+                "llm_tool_calls_executed": 0,
+                "plan": [],
+                "tool_calls": [],
+                "findings": [],
+                "model_findings_accepted": 0,
+                "model_findings_rejected": 0,
+                "attack_hypotheses": incident.get("attack_hypotheses", []),
+                "recommended_actions": [],
+                "narrative": (
+                    "Agent investigation was skipped by the explicit "
+                    "max_agent_investigations diagnostic limit. The candidate "
+                    "incident and its deterministic triage remain in the report."
+                ),
+                "reasoner_skipped_by_limit": reasoner is not None,
+            }
+        else:
+            executed_agent_investigations += 1
+            active_agent = (
+                llm_agent if llm_agent is not None
+                else deterministic_agent
+            )
+            investigation = active_agent.investigate(incident["incident_id"])
+            investigation["reasoner_skipped_by_limit"] = False
+
         incident["investigation_agent"] = investigation
         incident["recommended_actions"] = incident["recommended_actions"] + [
             action for action in investigation["recommended_actions"]
@@ -2252,6 +2301,11 @@ def run_soc_investigation_from_events(
         len(item.get("investigation_agent", {}).get("tool_calls", []))
         for item in incidents
     )
+    reasoner_incident_count = sum(
+        item.get("investigation_agent", {}).get("mode")
+        in {"tool_assisted_llm", "tool_assisted_llm_fallback"}
+        for item in incidents
+    )
     reasoner_call_count = sum(
         len(item.get("investigation_agent", {}).get("reasoner_calls", []))
         for item in incidents
@@ -2284,6 +2338,9 @@ def run_soc_investigation_from_events(
                 "tool_calls": tool_call_count,
                 "reasoner_calls": reasoner_call_count,
                 "llm_tool_rounds": llm_tool_round_count,
+                "reasoner_incidents": reasoner_incident_count,
+                "agent_investigations_executed": executed_agent_investigations,
+                "agent_investigations_skipped": skipped_agent_investigations,
             },
             {"name": "evidence_backed_reporting", "status": "completed", "output": "incident_investigation_report.md"},
         ],
@@ -2319,6 +2376,10 @@ def run_soc_investigation_from_events(
             "agent_reasoner_calls": reasoner_call_count,
             "llm_tool_rounds": llm_tool_round_count,
             "llm_tool_calls_executed": llm_tool_execution_count,
+            "reasoner_incidents": reasoner_incident_count,
+            "agent_investigations_executed": executed_agent_investigations,
+            "agent_investigations_skipped": skipped_agent_investigations,
+            "max_agent_investigations": max_agent_investigations,
             "review_only_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("review_only_flows", 0),
             "context_signal_flows": (pipeline_context or {}).get("behavioural_detection", {}).get("context_signal_flows", 0),
         },
@@ -2351,6 +2412,9 @@ def run_soc_investigation_from_events(
         "agent_reasoner_calls": reasoner_call_count,
         "llm_tool_rounds": llm_tool_round_count,
         "llm_tool_calls_executed": llm_tool_execution_count,
+        "reasoner_incidents": reasoner_incident_count,
+        "agent_investigations_executed": executed_agent_investigations,
+        "agent_investigations_skipped": skipped_agent_investigations,
         "event_count": len(events),
         "graph_nodes": graph.number_of_nodes(),
         "graph_edges": graph.number_of_edges(),
