@@ -288,6 +288,46 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
     assert summary["agent_tool_calls"] >= 6
 
 
+def test_cli_loads_existing_reasoner_callback_without_runtime_configuration(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from attack_graph.pipeline import load_reasoner_callable
+
+    plugin = types.ModuleType("existing_local_reasoner_plugin")
+
+    def configured_reasoner(context):
+        return {"narrative": "existing callback", "tool_calls": []}
+
+    plugin.existing_reasoner = configured_reasoner
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+
+    loaded = load_reasoner_callable(
+        "existing_local_reasoner_plugin:existing_reasoner"
+    )
+
+    assert loaded is configured_reasoner
+    assert loaded({"task": "smoke test"})["narrative"] == "existing callback"
+
+
+def test_reasoner_callable_loader_rejects_invalid_targets(monkeypatch):
+    import sys
+    import types
+    import pytest
+
+    from attack_graph.pipeline import load_reasoner_callable
+
+    plugin = types.ModuleType("reasoner_without_callable")
+    plugin.value = "not callable"
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+
+    with pytest.raises(ValueError, match="module:callable"):
+        load_reasoner_callable("invalid-format")
+
+    with pytest.raises(TypeError, match="not callable"):
+        load_reasoner_callable("reasoner_without_callable:value")
+
+
 def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
     flows = pd.DataFrame([
         {
