@@ -288,6 +288,100 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
     assert summary["agent_tool_calls"] >= 6
 
 
+def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST",
+            "anomaly_score": 0.01,
+        },
+        {
+            "timestamp": _time(1), "src_ip": "A", "dst_ip": "C", "protocol": 6,
+            "src_port": 50001, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST",
+            "anomaly_score": 0.02,
+        },
+    ])
+
+    calls = []
+
+    def fake_reasoner(context):
+        calls.append(context)
+        call_number = len(calls)
+
+        if call_number == 1:
+            return {
+                "tool_calls": [{
+                    "name": "get_host_activity",
+                    "arguments": {"host_ip": "A"},
+                }],
+                "preliminary_findings": [],
+                "narrative": "Inspect source host A.",
+            }
+
+        if call_number == 2:
+            assert context["completed_tool_results"][0]["tool"] == "get_host_activity"
+            assert context["remaining_tool_call_budget"] == 7
+            return {
+                "tool_calls": [{
+                    "name": "get_correlated_events",
+                    "arguments": {
+                        "event_id": "EVT-000001",
+                        "relation_contains": "same_source_temporal",
+                    },
+                }],
+                "preliminary_findings": [],
+                "narrative": "Inspect the source-linked event pair.",
+            }
+
+        assert call_number == 3
+        assert len(context["completed_tool_results"]) == 2
+        return {
+            "tool_calls": [],
+            "narrative": "Source A generated two temporally correlated network-flow events.",
+            "findings": [{
+                "claim": "Source A contacted two distinct destinations in the candidate window.",
+                "evidence_event_ids": ["EVT-000001", "EVT-000002"],
+                "confidence": "certain",
+            }],
+        }
+
+    run_soc_investigation(flows, tmp_path, reasoner=fake_reasoner)
+
+    payload = json.loads(
+        (tmp_path / "incident_investigation.json").read_text()
+    )
+    agent = payload["incidents"][0]["investigation_agent"]
+
+    assert len(calls) == 3
+    assert agent["mode"] == "tool_assisted_llm"
+    assert agent["llm_tool_rounds"] == 2
+    assert agent["llm_tool_requests"] == 2
+    assert agent["llm_tool_calls_executed"] == 2
+    assert [item["phase"] for item in agent["reasoner_calls"]] == [
+        "initial_plan",
+        "tool_followup",
+        "final_synthesis",
+    ]
+    assert sum(
+        call["status"] == "success"
+        and call["tool"] in {"get_host_activity", "get_correlated_events"}
+        for call in agent["tool_calls"]
+    ) == 2
+
+    model_finding = next(
+        finding for finding in agent["findings"]
+        if finding["source"] == "llm_evidence_validated"
+    )
+    assert model_finding["confidence"] == "low"
+    assert model_finding["validation_scope"] == "event_id_membership_only"
+    assert model_finding["claim_semantics_independently_verified"] is False
+    assert model_finding["analyst_validation_required"] is True
+
+
 def test_reasoner_failure_falls_back_to_deterministic_investigation(tmp_path):
     flows = pd.DataFrame([
         {
