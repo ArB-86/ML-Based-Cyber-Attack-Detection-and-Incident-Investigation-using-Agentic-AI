@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,31 @@ class PipelineConfig:
     verify_only: bool = False
     reuse_predictions: str | None = None
     reasoner: Callable[[dict[str, Any]], str | dict[str, Any]] | None = None
+
+
+def load_reasoner_callable(spec: str | None) -> Callable[[dict[str, Any]], str | dict[str, Any]] | None:
+    """Load an existing reasoner callback from a module:callable import path.
+
+    This is dependency injection only. It does not create, configure or start
+    an LLM/Ollama runtime; the imported callback retains ownership of its
+    existing model, endpoint, prompt and runtime settings.
+    """
+    if spec is None:
+        return None
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError("Reasoner callable must use the format module:callable.")
+    module_name, separator, attribute_name = spec.strip().partition(":")
+    if not separator or not module_name.strip() or not attribute_name.strip():
+        raise ValueError(
+            "Invalid --reasoner-callable. Expected an import path like my_module:reasoner."
+        )
+    module = importlib.import_module(module_name.strip())
+    callback: Any = module
+    for part in attribute_name.strip().split("."):
+        callback = getattr(callback, part)
+    if not callable(callback):
+        raise TypeError(f"Configured reasoner target is not callable: {spec}")
+    return callback
 
 
 def run_pipeline(config: PipelineConfig) -> None:
@@ -77,6 +103,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--output-dir", default="soc_output")
     parser.add_argument(
+        "--reasoner-callable",
+        default=None,
+        metavar="MODULE:CALLABLE",
+        help=(
+            "Import an existing reasoner callback, for example my_ollama_bridge:reasoner. "
+            "The callback's model/server/prompt configuration is not modified."
+        ),
+    )
+    parser.add_argument(
         "--reuse-predictions",
         default=None,
         help=(
@@ -101,6 +136,7 @@ def main(argv: list[str] | None = None) -> None:
         benchmark_parquet=args.benchmark_parquet,
         verify_only=args.verify_only,
         reuse_predictions=args.reuse_predictions,
+        reasoner=load_reasoner_callable(args.reasoner_callable),
     ))
 
 
