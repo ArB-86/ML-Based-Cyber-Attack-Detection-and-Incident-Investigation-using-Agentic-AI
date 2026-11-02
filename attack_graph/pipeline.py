@@ -22,6 +22,7 @@ class PipelineConfig:
     verify_only: bool = False
     reuse_predictions: str | None = None
     reasoner: Callable[[dict[str, Any]], str | dict[str, Any]] | None = None
+    max_agent_investigations: int | None = None
 
 
 def load_reasoner_callable(spec: str | None) -> Callable[[dict[str, Any]], str | dict[str, Any]] | None:
@@ -68,6 +69,7 @@ def run_pipeline(config: PipelineConfig) -> None:
             predictions_path=str(prediction_path),
             output_dir=config.output_dir,
             reasoner=config.reasoner,
+            max_agent_investigations=config.max_agent_investigations,
         )
         return
 
@@ -88,6 +90,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         benchmark_parquet=config.benchmark_parquet,
         verify_only=config.verify_only,
         reasoner=config.reasoner,
+        max_agent_investigations=config.max_agent_investigations,
     )
 
 
@@ -102,6 +105,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Directory containing the eight metadata-rich CICIDS2017 CSV files (omit when replaying saved predictions).",
     )
     parser.add_argument("--output-dir", default="soc_output")
+    parser.add_argument(
+        "--max-agent-investigations",
+        type=int,
+        default=None,
+        help=(
+            "Optional diagnostic cap on the number of incidents receiving agent investigation. "
+            "Use 1 for a single-incident LLM smoke test; remaining candidates are retained "
+            "but explicitly marked as not investigated. Default: investigate all incidents."
+        ),
+    )
     parser.add_argument(
         "--reasoner-callable",
         default=None,
@@ -137,6 +150,7 @@ def main(argv: list[str] | None = None) -> None:
         verify_only=args.verify_only,
         reuse_predictions=args.reuse_predictions,
         reasoner=load_reasoner_callable(args.reasoner_callable),
+        max_agent_investigations=args.max_agent_investigations,
     ))
 
 
