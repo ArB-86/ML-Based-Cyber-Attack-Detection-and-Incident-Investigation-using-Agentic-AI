@@ -1698,6 +1698,8 @@ class AgenticInvestigationAgent:
             "Treat this as a candidate incident pending validation against endpoint, identity and service telemetry."
         )
         model_findings: list[dict[str, Any]] = []
+        model_finding_candidates: list[dict[str, Any]] = []
+        model_finding_candidate_keys: set[str] = set()
         model_response: dict[str, Any] = {}
 
         reasoner_error = None
@@ -1708,6 +1710,20 @@ class AgenticInvestigationAgent:
         model_response: dict[str, Any] = {}
 
         if self.reasoner is not None:
+            def collect_model_finding_candidates(response: dict[str, Any]) -> None:
+                """Retain typed findings from every reasoning phase for validation."""
+                for field in ("preliminary_findings", "findings"):
+                    values = response.get(field, [])
+                    if not isinstance(values, list):
+                        continue
+                    for finding in values:
+                        if not isinstance(finding, dict):
+                            continue
+                        key = json.dumps(finding, sort_keys=True, default=str)
+                        if key not in model_finding_candidate_keys:
+                            model_finding_candidate_keys.add(key)
+                            model_finding_candidates.append(dict(finding))
+
             def invoke_reasoner(
                 context: dict[str, Any],
                 *,
@@ -1718,6 +1734,9 @@ class AgenticInvestigationAgent:
                 try:
                     response = self._decode_reasoner_response(self.reasoner(context))
                     requested = response.get("tool_calls", [])
+                    collect_model_finding_candidates(response)
+                    preliminary = response.get("preliminary_findings", [])
+                    findings = response.get("findings", [])
                     reasoner_calls.append({
                         "phase": phase,
                         "round": round_number,
@@ -1725,6 +1744,14 @@ class AgenticInvestigationAgent:
                         "requested_tool_count": (
                             len(requested) if isinstance(requested, list) else 0
                         ),
+                        "finding_counts": {
+                            "preliminary_findings": (
+                                len(preliminary) if isinstance(preliminary, list) else 0
+                            ),
+                            "findings": (
+                                len(findings) if isinstance(findings, list) else 0
+                            ),
+                        },
                         "response_keys": sorted(str(key) for key in response),
                     })
                     return response
@@ -2054,21 +2081,12 @@ class AgenticInvestigationAgent:
                         model_response = final_response
                     break
 
-            preliminary = model_response.get(
-                "findings",
-                model_response.get(
-                    "preliminary_findings",
-                    initial_response.get("preliminary_findings", [])
-                    if initial_response is not None else [],
-                ),
-            )
             event_lookup = {
                 str(event["event_id"]): event
                 for event in timeline
                 if isinstance(event, dict) and event.get("event_id") is not None
             }
-            if isinstance(preliminary, list):
-                for finding in preliminary:
+            for finding in model_finding_candidates:
                     if not isinstance(finding, dict):
                         continue
                     validated, error = _validate_model_finding(
@@ -2129,6 +2147,7 @@ class AgenticInvestigationAgent:
             ],
             "tool_calls": trace,
             "findings": all_findings,
+            "model_findings_proposed": len(model_finding_candidates),
             "model_findings_accepted": len(model_findings),
             "model_findings_rejected": sum(
                 call.get("tool") == "validate_model_finding" for call in trace
