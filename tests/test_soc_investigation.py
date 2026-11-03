@@ -283,7 +283,7 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
         for call in agent["tool_calls"]
     )
     assert any(
-        finding["source"] == "llm_evidence_validated"
+        finding["source"] == "llm_semantic_validated"
         for finding in agent["findings"]
     )
     assert summary["agent_tool_calls"] >= 6
