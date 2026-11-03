@@ -470,9 +470,10 @@ def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
             "tool_calls": [],
             "narrative": "Source A generated two temporally correlated network-flow events.",
             "findings": [{
-                "claim": "Source A contacted two distinct destinations in the candidate window.",
+                "claim_type": "isolation_forest_anomaly",
+                "claim": "These events carry Isolation Forest anomaly detection metadata.",
                 "evidence_event_ids": ["EVT-000001", "EVT-000002"],
-                "confidence": "certain",
+                "confidence": "high",
             }],
         }
 
@@ -501,12 +502,169 @@ def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
 
     model_finding = next(
         finding for finding in agent["findings"]
-        if finding["source"] == "llm_evidence_validated"
+        if finding["source"] == "llm_semantic_validated"
     )
+    assert model_finding["claim_type"] == "isolation_forest_anomaly"
     assert model_finding["confidence"] == "low"
-    assert model_finding["validation_scope"] == "event_id_membership_only"
-    assert model_finding["claim_semantics_independently_verified"] is False
+    assert model_finding["validation_scope"] == "detector_metadata_predicate"
+    assert model_finding["claim_semantics_independently_verified"] is True
     assert model_finding["analyst_validation_required"] is True
+
+
+def test_semantic_validator_requires_matching_detection_provenance():
+    from attack_graph.soc_investigation import _validate_model_finding
+
+    events = {
+        "E1": {
+            "event_id": "E1",
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST",
+        },
+        "E2": {
+            "event_id": "E2",
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "BEHAVIOURAL_RULE",
+        },
+    }
+    finding = {
+        "claim_type": "isolation_forest_anomaly",
+        "claim": "Isolation Forest anomalies were observed.",
+        "evidence_event_ids": ["E1", "E2"],
+    }
+
+    validated, error = _validate_model_finding(finding, events, {"E1", "E2"})
+
+    assert error is None
+    assert validated is not None
+    assert validated["evidence_event_ids"] == ["E1"]
+    assert validated["excluded_event_ids"] == ["E2"]
+    assert validated["confidence"] == "low"
+    assert validated["semantic_validation"]["status"] == "passed"
+
+
+def test_semantic_validator_rejects_combined_or_unsupported_claims():
+    from attack_graph.soc_investigation import _validate_model_finding
+
+    events = {
+        "E1": {
+            "event_id": "E1",
+            "context_signals": "HIGH_SOURCE_FANOUT;HORIZONTAL_SCAN",
+        }
+    }
+    combined = {
+        "claim": "High source fanout and horizontal scan suggest lateral movement.",
+        "evidence_event_ids": ["E1"],
+    }
+    unsupported = {
+        "claim": "The host was compromised and lateral movement succeeded.",
+        "evidence_event_ids": ["E1"],
+    }
+
+    validated, error = _validate_model_finding(combined, events, {"E1"})
+    assert validated is None
+    assert "combines multiple evidence categories" in error
+
+    validated, error = _validate_model_finding(unsupported, events, {"E1"})
+    assert validated is None
+    assert "cannot be inferred" in error
+
+
+def test_semantic_validator_calculates_distinct_hosts_and_services():
+    from attack_graph.soc_investigation import _validate_model_finding
+
+    events = {
+        "E1": {
+            "event_id": "E1",
+            "src_ip": "10.0.0.1",
+            "dst_ip": "10.0.0.2",
+            "protocol": "6.0",
+            "dst_ports": [443],
+        },
+        "E2": {
+            "event_id": "E2",
+            "src_ip": "10.0.0.3",
+            "dst_ip": "10.0.0.4",
+            "protocol": "17.0",
+            "dst_ports": [53],
+        },
+    }
+    finding = {
+        "claim_type": "multi_host_multi_service",
+        "claim": "The incident spans multiple hosts and services.",
+        "evidence_event_ids": ["E1", "E2"],
+    }
+
+    validated, error = _validate_model_finding(finding, events, {"E1", "E2"})
+
+    assert error is None
+    assert validated is not None
+    assert "4 distinct endpoint IPs" in validated["claim"]
+    assert "2 distinct destination services" in validated["claim"]
+    assert validated["validation_scope"] == "derived_event_metadata_metrics"
+
+
+def test_semantic_validator_requires_exact_host_pivot_edge():
+    from attack_graph.soc_investigation import _validate_model_finding
+
+    events = {
+        "E1": {"event_id": "E1"},
+        "E2": {"event_id": "E2"},
+        "E3": {"event_id": "E3"},
+    }
+    edges = [{
+        "from": "event:E1",
+        "to": "event:E2",
+        "relation": "host_pivot",
+        "pivot_host": "10.0.0.2",
+    }]
+    supported = {
+        "claim_type": "host_pivot_lead",
+        "claim": "A host pivot was observed.",
+        "evidence_event_ids": ["E1", "E2"],
+    }
+    unsupported = {
+        "claim_type": "host_pivot_lead",
+        "claim": "A host pivot was observed.",
+        "evidence_event_ids": ["E1", "E3"],
+    }
+
+    validated, error = _validate_model_finding(
+        supported, events, {"E1", "E2", "E3"}, edges
+    )
+    assert error is None
+    assert validated is not None
+    assert validated["evidence_event_ids"] == ["E1", "E2"]
+    assert "not proof" in validated["claim"]
+
+    validated, error = _validate_model_finding(
+        unsupported, events, {"E1", "E2", "E3"}, edges
+    )
+    assert validated is None
+    assert "No exact host_pivot graph edge" in error
+
+
+def test_semantic_validator_rejects_event_ids_outside_incident():
+    from attack_graph.soc_investigation import _validate_model_finding
+
+    events = {
+        "E1": {
+            "event_id": "E1",
+            "detection_reasons": "BRUTE_FORCE_PATTERN",
+        },
+        "OUTSIDE": {
+            "event_id": "OUTSIDE",
+            "detection_reasons": "BRUTE_FORCE_PATTERN",
+        },
+    }
+    finding = {
+        "claim_type": "brute_force_flow_pattern",
+        "claim": "A brute-force flow pattern was detected.",
+        "evidence_event_ids": ["E1", "OUTSIDE"],
+    }
+
+    validated, error = _validate_model_finding(finding, events, {"E1"})
+    assert validated is None
+    assert "outside the current incident" in error
 
 
 def test_reasoner_failure_falls_back_to_deterministic_investigation(tmp_path):
