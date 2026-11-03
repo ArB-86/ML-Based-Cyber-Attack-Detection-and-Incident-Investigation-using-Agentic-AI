@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+import ast
 import json
 import math
 from pathlib import Path
@@ -1269,6 +1270,265 @@ class IncidentEvidenceTools:
         return matches
 
 
+_SUPPORTED_MODEL_CLAIM_TYPES = {
+    "isolation_forest_anomaly",
+    "high_source_fanout",
+    "horizontal_scan",
+    "brute_force_flow_pattern",
+    "multi_host_multi_service",
+    "host_pivot_lead",
+}
+
+
+def _semantic_tokens(value: Any) -> set[str]:
+    """Normalize event metadata tokens, including CSV-serialized list values."""
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        raw = str(value).strip()
+        if raw.casefold() in {"", "nan", "none", "null", "<na>"}:
+            return set()
+        parsed = None
+        if raw.startswith(("[", "(")):
+            try:
+                parsed = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            values = list(parsed)
+        else:
+            values = raw.replace(",", ";").split(";")
+    return {
+        str(item).strip().upper()
+        for item in values
+        if str(item).strip()
+        and str(item).strip().casefold() not in {"nan", "none", "null", "<na>"}
+    }
+
+
+def _resolve_model_claim_type(finding: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Resolve explicit claim types; conservatively infer one for legacy callbacks."""
+    raw_type = str(finding.get("claim_type", "")).strip().casefold()
+    if raw_type:
+        if raw_type in _SUPPORTED_MODEL_CLAIM_TYPES:
+            return raw_type, None
+        return None, f"Unsupported claim_type: {raw_type!r}."
+
+    claim = str(finding.get("claim", finding.get("finding", ""))).casefold()
+    normalized = claim.replace("_", " ").replace("-", " ")
+    matches: list[str] = []
+    if "isolation forest" in normalized:
+        matches.append("isolation_forest_anomaly")
+    if "high source fanout" in normalized or "source fanout" in normalized:
+        matches.append("high_source_fanout")
+    if "horizontal scan" in normalized:
+        matches.append("horizontal_scan")
+    if "brute force" in normalized:
+        matches.append("brute_force_flow_pattern")
+    if "multiple hosts" in normalized and (
+        "service" in normalized or "ports" in normalized
+    ):
+        matches.append("multi_host_multi_service")
+    if "host pivot" in normalized or "pivot lead" in normalized:
+        matches.append("host_pivot_lead")
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, "Claim combines multiple evidence categories; split it into separate findings."
+    return None, "Claim has no supported claim_type and cannot be inferred unambiguously."
+
+
+def _validate_model_finding(
+    finding: dict[str, Any],
+    event_lookup: dict[str, dict[str, Any]],
+    allowed_event_ids: set[str],
+    graph_event_edges: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate a model claim against event metadata and exact graph relationships."""
+    claim_text = str(finding.get("claim", finding.get("finding", ""))).strip()
+    if not claim_text:
+        return None, "Finding has no non-empty claim."
+    claim_type, type_error = _resolve_model_claim_type(finding)
+    if claim_type is None:
+        return None, type_error or "Unsupported claim type."
+
+    raw_refs = finding.get("evidence_event_ids", [])
+    if isinstance(raw_refs, str):
+        raw_refs = [raw_refs]
+    if not isinstance(raw_refs, (list, tuple, set)):
+        return None, "Evidence event IDs must be an array or string."
+    event_refs = list(dict.fromkeys(
+        str(value).strip()
+        for value in raw_refs
+        if value is not None and str(value).strip()
+    ))
+    if not event_refs:
+        return None, "Finding has no supporting event IDs."
+    if not set(event_refs).issubset(allowed_event_ids):
+        return None, "Finding cites events outside the current incident."
+    if not set(event_refs).issubset(event_lookup):
+        return None, "One or more cited event records are unavailable."
+
+    verified_refs: list[str] = []
+    excluded_refs: list[str] = []
+    evidence_edges: list[dict[str, Any]] = []
+
+    predicates = {
+        "isolation_forest_anomaly": lambda event: (
+            "ISOLATION_FOREST_ANOMALY" in _semantic_tokens(
+                event.get("detection_reasons")
+            )
+            and "ISOLATION_FOREST" in _semantic_tokens(
+                event.get("alert_sources")
+            )
+        ),
+        "high_source_fanout": lambda event: (
+            "HIGH_SOURCE_FANOUT" in _semantic_tokens(event.get("context_signals"))
+        ),
+        "horizontal_scan": lambda event: (
+            "HORIZONTAL_SCAN" in _semantic_tokens(event.get("context_signals"))
+        ),
+        "brute_force_flow_pattern": lambda event: (
+            "BRUTE_FORCE_PATTERN" in _semantic_tokens(event.get("detection_reasons"))
+        ),
+    }
+
+    if claim_type in predicates:
+        for event_id in event_refs:
+            if predicates[claim_type](event_lookup[event_id]):
+                verified_refs.append(event_id)
+            else:
+                excluded_refs.append(event_id)
+        if not verified_refs:
+            return None, f"No cited event satisfies the {claim_type} evidence predicate."
+
+        count = len(verified_refs)
+        canonical_claims = {
+            "isolation_forest_anomaly": (
+                f"{count} cited event(s) carry the Isolation Forest anomaly "
+                "detection reason and alert-source metadata. An anomaly flag "
+                "alone does not establish malicious activity."
+            ),
+            "high_source_fanout": (
+                f"{count} cited event(s) carry the HIGH_SOURCE_FANOUT context "
+                "signal. This is contextual evidence, not proof of malicious scanning."
+            ),
+            "horizontal_scan": (
+                f"{count} cited event(s) carry the HORIZONTAL_SCAN context "
+                "signal. This is a review lead, not confirmation of compromise."
+            ),
+            "brute_force_flow_pattern": (
+                f"{count} cited event(s) carry the BRUTE_FORCE_PATTERN "
+                "detection reason. Network-flow evidence does not establish "
+                "authentication outcomes."
+            ),
+        }
+        canonical_claim = canonical_claims[claim_type]
+        validation_scope = (
+            "detector_metadata_predicate"
+            if claim_type in {
+                "isolation_forest_anomaly",
+                "brute_force_flow_pattern",
+            }
+            else "context_signal_predicate"
+        )
+
+    elif claim_type == "multi_host_multi_service":
+        hosts: set[str] = set()
+        services: set[tuple[str, int]] = set()
+        for event_id in event_refs:
+            event = event_lookup[event_id]
+            for field in ("src_ip", "dst_ip"):
+                host = str(event.get(field, "")).strip()
+                if host and host.casefold() not in {"nan", "none", "null"}:
+                    hosts.add(host)
+            protocol = str(event.get("protocol", "")).strip()
+            raw_ports = event.get("dst_ports")
+            if raw_ports is None:
+                raw_ports = event.get("dst_port")
+            for token in _semantic_tokens(raw_ports):
+                try:
+                    port = int(token)
+                except (TypeError, ValueError):
+                    continue
+                if protocol and 0 <= port <= 65535:
+                    services.add((protocol, port))
+        if len(hosts) < 2 or len(services) < 2:
+            return None, (
+                "Cited events do not establish at least two endpoint IPs "
+                "and two distinct protocol/destination-port combinations."
+            )
+        verified_refs = list(event_refs)
+        service_labels = sorted(f"{protocol}/{port}" for protocol, port in services)
+        canonical_claim = (
+            f"The cited events contain {len(hosts)} distinct endpoint IPs "
+            f"and {len(services)} distinct destination services "
+            f"({', '.join(service_labels)}). This describes observed network "
+            "diversity, not a confirmed multi-stage attack."
+        )
+        validation_scope = "derived_event_metadata_metrics"
+
+    elif claim_type == "host_pivot_lead":
+        cited = set(event_refs)
+        for edge in graph_event_edges or []:
+            if not isinstance(edge, dict):
+                continue
+            relation_tokens = _semantic_tokens(
+                str(edge.get("relation", "")).replace("|", ";")
+            )
+            source_id = str(
+                edge.get("from", edge.get("from_event", ""))
+            ).removeprefix("event:")
+            target_id = str(
+                edge.get("to", edge.get("to_event", ""))
+            ).removeprefix("event:")
+            if (
+                "HOST_PIVOT" in relation_tokens
+                and source_id in cited
+                and target_id in cited
+            ):
+                evidence_edges.append(edge)
+                verified_refs.extend([source_id, target_id])
+        verified_refs = list(dict.fromkeys(verified_refs))
+        if not evidence_edges:
+            return None, "No exact host_pivot graph edge connects the cited event IDs."
+        excluded_refs = [event_id for event_id in event_refs if event_id not in verified_refs]
+        pivot_hosts = sorted({
+            str(edge.get("pivot_host"))
+            for edge in evidence_edges
+            if edge.get("pivot_host") not in (None, "")
+        })
+        host_text = ", ".join(pivot_hosts) if pivot_hosts else "the same pivot host"
+        canonical_claim = (
+            f"A directed host-pivot graph relationship involving {host_text} "
+            "connects the cited events. This is an investigation lead, not "
+            "proof of authenticated lateral movement or host compromise."
+        )
+        validation_scope = "exact_graph_edge_predicate"
+
+    return {
+        "claim": canonical_claim,
+        "model_claim": claim_text,
+        "claim_type": claim_type,
+        "evidence_event_ids": verified_refs,
+        "excluded_event_ids": excluded_refs,
+        "evidence_edges": evidence_edges,
+        "confidence": "low",
+        "source": "llm_semantic_validated",
+        "validation_scope": validation_scope,
+        "claim_semantics_independently_verified": True,
+        "analyst_validation_required": True,
+        "semantic_validation": {
+            "status": "passed",
+            "claim_type": claim_type,
+            "verified_event_count": len(verified_refs),
+            "excluded_event_ids": excluded_refs,
+        },
+    }, None
+
+
 class AgenticInvestigationAgent:
     """Run deterministic evidence collection and bounded iterative LLM tool use.
 
@@ -1503,7 +1763,7 @@ class AgenticInvestigationAgent:
                         "Act as a SOC analyst. Inspect the supplied evidence, identify what is "
                         "still unknown, and request only relevant read-only tools. Do not assert "
                         "compromise from flow metadata alone. Return JSON with tool_calls (max 5), "
-                        "preliminary_findings and narrative."
+                        "preliminary_findings (each with claim_type, claim and event IDs) and narrative."
                     ),
                     "incident": incident,
                     "timeline": timeline,
@@ -1517,6 +1777,7 @@ class AgenticInvestigationAgent:
                             "arguments": {},
                         }],
                         "preliminary_findings": [{
+                            "claim_type": "one supported claim type",
                             "claim": "string",
                             "evidence_event_ids": ["event id"],
                             "confidence": "low|medium|high",
@@ -1693,7 +1954,8 @@ class AgenticInvestigationAgent:
                                 continue
 
                         # Never trust an incident ID supplied by the model.
-                        arguments["incident_id"] = incident_id
+                        if name != "get_event":
+                            arguments["incident_id"] = incident_id
                         result = self._record_call(
                             trace, name, arguments, self.available_tools[name]
                         )
@@ -1726,7 +1988,7 @@ class AgenticInvestigationAgent:
                                     "completed tool results. Identify remaining evidence gaps. Request "
                                     "only additional relevant allowlisted read-only tools; otherwise "
                                     "return final JSON with tool_calls as an empty array, findings and "
-                                    "narrative. Do not infer compromise from flow metadata alone."
+                                    "narrative. Each finding must identify one claim_type and cite only supporting events. Do not infer compromise from flow metadata alone."
                                 ),
                                 "incident": incident,
                                 "initial_evidence": {
@@ -1758,7 +2020,7 @@ class AgenticInvestigationAgent:
                                 "Return JSON with an empty tool_calls array, findings with exact event IDs, "
                                 "a concise narrative, uncertainty/caveats and recommended analyst actions. "
                                 "Do not invent users, process execution, successful logins, exfiltration "
-                                "or business impact."
+                                "or business impact. Each finding must identify one claim_type and cite only supporting events."
                             ),
                             "incident": incident,
                             "initial_evidence": {
@@ -1771,6 +2033,7 @@ class AgenticInvestigationAgent:
                             "response_contract": {
                                 "tool_calls": [],
                                 "findings": [{
+                                    "claim_type": "one supported claim type",
                                     "claim": "string",
                                     "evidence_event_ids": ["event id"],
                                     "confidence": "low|medium|high",
@@ -1799,51 +2062,44 @@ class AgenticInvestigationAgent:
                     if initial_response is not None else [],
                 ),
             )
+            event_lookup = {
+                str(event["event_id"]): event
+                for event in timeline
+                if isinstance(event, dict) and event.get("event_id") is not None
+            }
             if isinstance(preliminary, list):
                 for finding in preliminary:
                     if not isinstance(finding, dict):
                         continue
-                    raw_event_refs = finding.get("evidence_event_ids", [])
-                    if isinstance(raw_event_refs, str):
-                        raw_event_refs = [raw_event_refs]
-                    if not isinstance(raw_event_refs, (list, tuple, set)):
-                        raw_event_refs = []
-                    event_refs = list(dict.fromkeys(
-                        str(value).strip()
-                        for value in raw_event_refs
-                        if str(value).strip()
-                    ))
-                    claim_text = str(
-                        finding.get("claim", finding.get("finding", ""))
-                    ).strip()
-                    confidence = str(finding.get("confidence", "low")).lower()
-                    if confidence not in {"low", "medium", "high"}:
-                        confidence = "low"
-
-                    if (
-                        claim_text
-                        and event_refs
-                        and set(event_refs).issubset(allowed_event_ids)
-                    ):
-                        model_findings.append({
-                            "claim": claim_text,
-                            "evidence_event_ids": event_refs,
-                            "evidence_edges": [],
-                            "confidence": confidence,
-                            "source": "llm_evidence_validated",
-                            "validation_scope": "event_id_membership_only",
-                            "claim_semantics_independently_verified": False,
-                            "analyst_validation_required": True,
-                        })
+                    validated, error = _validate_model_finding(
+                        finding,
+                        event_lookup,
+                        allowed_event_ids,
+                        graph_event_edges=graph.get("event_edges", []),
+                    )
+                    if validated is not None:
+                        model_findings.append(validated)
+                        if validated.get("excluded_event_ids"):
+                            trace.append({
+                                "tool": "validate_model_finding_partial",
+                                "status": "partially_accepted",
+                                "error": (
+                                    "Unsupported cited events were excluded; "
+                                    "the accepted claim uses only verified evidence."
+                                ),
+                                "evidence_refs": validated["excluded_event_ids"],
+                            })
                     else:
+                        raw_refs = finding.get("evidence_event_ids", [])
                         trace.append({
                             "tool": "validate_model_finding",
                             "status": "rejected",
-                            "error": (
-                                "Finding lacks a non-empty claim and valid event references, "
-                                "or cites events outside this incident."
+                            "error": error or "Semantic validation failed.",
+                            "evidence_refs": (
+                                raw_refs if isinstance(raw_refs, list)
+                                else [raw_refs] if isinstance(raw_refs, str)
+                                else []
                             ),
-                            "evidence_refs": [],
                         })
 
         all_findings = claims + model_findings
@@ -1876,6 +2132,9 @@ class AgenticInvestigationAgent:
             "model_findings_accepted": len(model_findings),
             "model_findings_rejected": sum(
                 call.get("tool") == "validate_model_finding" for call in trace
+            ),
+            "model_findings_partially_accepted": sum(
+                call.get("tool") == "validate_model_finding_partial" for call in trace
             ),
             "attack_hypotheses": incident.get("attack_hypotheses", []),
             "recommended_actions": list(incident.get("recommended_actions", [])),
