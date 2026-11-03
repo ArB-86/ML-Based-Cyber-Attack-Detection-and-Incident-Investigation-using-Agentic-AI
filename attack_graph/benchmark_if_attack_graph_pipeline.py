@@ -21,8 +21,9 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from .event_builder import EventConfig, build_attack_events, normalize_columns
-from .graph_builder import add_sequence_edges, build_attack_graph, write_attack_graph_gexf
+from .event_builder import normalize_columns
+from .soc_detection import merge_detector_outputs
+from .soc_investigation import run_soc_investigation
 
 
 LABEL_MAP = {
@@ -284,6 +285,32 @@ def load_metadata_dataset(data_dir: Path) -> pd.DataFrame:
         )
         frame = _resolve_columns(frame)
 
+        # Some exported CICIDS CSVs contain a trailing block of fully empty
+        # records. They carry no flow features or metadata and must be removed
+        # at ingestion, before timestamp validation or model preprocessing.
+        # Do not drop partially populated rows: those indicate a real schema/
+        # data-quality problem and should remain visible to validation.
+        empty_rows = frame.isna().all(axis=1)
+        empty_row_count = int(empty_rows.sum())
+        if empty_row_count:
+            print(
+                f"Removed fully empty rows from {filename}: "
+                f"{empty_row_count:,}"
+            )
+            frame = frame.loc[~empty_rows].copy()
+
+        if "timestamp" not in frame.columns:
+            raise ValueError(f"Missing Timestamp column in {filename}")
+        missing_timestamps = (
+            frame["timestamp"].isna()
+            | frame["timestamp"].astype("string").str.strip().eq("")
+        )
+        if missing_timestamps.any():
+            raise ValueError(
+                f"{filename} contains {int(missing_timestamps.sum()):,} "
+                "non-empty flow rows with missing timestamps."
+            )
+
         if "label" not in frame.columns:
             raise ValueError(f"Missing Label column in {filename}")
 
@@ -316,11 +343,16 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if missing:
         raise ValueError(f"Missing benchmark preprocessing columns: {sorted(set(missing))}")
 
-    # Deduplicate on the benchmark's 78 columns (69 final + 8 constants + Label).
-    # Metadata columns are deliberately excluded so the deduplication semantics
-    # match the no-metadata preprocessing notebook.
+    # Keep distinct network records even when their numeric feature vectors
+    # match. The separate no-metadata benchmark verifier retains its historical
+    # notebook preprocessing for reproducibility.
     raw_numeric = BENCHMARK_FEATURES + sorted(CONSTANT_FEATURES)
-    dedup_columns = [c for c in raw_numeric if c in work.columns] + ["label"]
+    metadata_columns = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port"]
+    dedup_columns = (
+        [c for c in raw_numeric if c in work.columns]
+        + [c for c in metadata_columns if c in work.columns]
+        + ["label"]
+    )
     before = len(work)
     work = work.drop_duplicates(subset=dedup_columns, keep="first").reset_index(drop=True)
     print(f"Rows before deduplication: {before:,}")
@@ -342,16 +374,15 @@ def exact_preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     constant_present = [c for c in sorted(CONSTANT_FEATURES) if c in work.columns]
     work = work.drop(columns=constant_present)
 
-    # Build the 69-feature matrix. This follows the benchmark notebook:
-    # numeric conversion, +/-inf -> NaN, then whole-dataset median fill.
+    # Leave missing values intact. The operational metadata path fits its
+    # imputer on training rows only after the train/validation/test split.
     x = pd.DataFrame(index=work.index)
     for col in BENCHMARK_FEATURES:
         x[col] = pd.to_numeric(work[col], errors="coerce")
 
     x = x.replace([np.inf, -np.inf], np.nan)
-    x = x.fillna(x.median(numeric_only=True))
 
-    # Keep the cleaned 69-feature values in the preserved metadata table too.
+    # Keep the numeric values (including NaNs) in the metadata table.
     for col in BENCHMARK_FEATURES:
         work[col] = x[col]
 
@@ -570,8 +601,13 @@ def run(
     output_dir: str,
     benchmark_parquet: str | None = None,
     verify_only: bool = False,
+    reasoner=None,
+    max_agent_investigations: int | None = None,
 ) -> None:
     start = time.time()
+
+    if verify_only and not benchmark_parquet:
+        raise ValueError("--verify-only requires --benchmark-parquet.")
 
     if benchmark_parquet:
         exact_result = reproduce_exact_benchmark(
@@ -625,6 +661,14 @@ def run(
         )
     train_benign_idx = train_benign_frame["_row_idx"].to_numpy()
 
+    # Fit missing-value statistics on training rows only. Reuse these medians
+    # unchanged for validation, test and all-flow scoring.
+    train_medians = x.iloc[train_idx].median(numeric_only=True)
+    train_medians = train_medians.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    x = x.fillna(train_medians).fillna(0.0)
+    for feature in BENCHMARK_FEATURES:
+        df[feature] = x[feature]
+
     print(f"Train rows     : {len(train_idx):,}")
     print(f"Validation rows: {len(val_idx):,}")
     print(f"Test rows      : {len(test_idx):,}")
@@ -638,97 +682,111 @@ def run(
         random_state=42,
         n_jobs=-1,
     )
-    if benchmark_parquet:
-        # Retrain here from the same exact Parquet sample after applying the
-        # same feature-matrix cleanup used by isolation_forest.ipynb.
-        benchmark_df = pd.read_parquet(benchmark_parquet)
-        benchmark_X = benchmark_df.drop(columns=["Label"]).copy()
-        benchmark_y = (
-            benchmark_df["Label"].astype(str).str.strip() != "Benign"
-        ).astype(int)
-        benchmark_feature_names = [str(c).strip().lower() for c in benchmark_X.columns]
-        if benchmark_feature_names != BENCHMARK_FEATURES:
-            missing = [c for c in BENCHMARK_FEATURES if c not in benchmark_feature_names]
-            extra = [c for c in benchmark_feature_names if c not in BENCHMARK_FEATURES]
-            raise ValueError(
-                "Benchmark Parquet feature order/set does not match the expected "
-                f"69-feature benchmark layout. Missing={missing}; Extra={extra}"
-            )
-        benchmark_X.columns = benchmark_feature_names
-        benchmark_X = benchmark_X.replace([np.inf, -np.inf], np.nan)
-        if benchmark_X.isna().sum().sum() > 0:
-            benchmark_X = benchmark_X.fillna(
-                benchmark_X.median(numeric_only=True)
-            )
-        constant_cols = benchmark_X.columns[benchmark_X.nunique() <= 1].tolist()
-        if constant_cols:
-            benchmark_X = benchmark_X.drop(columns=constant_cols)
-        X_train, _, y_train, _ = train_test_split(
-            benchmark_X,
-            benchmark_y,
-            test_size=0.30,
-            random_state=42,
-            stratify=benchmark_y,
-        )
-        X_train_benign = X_train[y_train == 0]
-        X_train_benign_sample = X_train_benign.sample(
-            n=MAX_TRAIN_SAMPLES,
-            random_state=42,
-        )
-        model.fit(X_train_benign_sample)
-    else:
-        model.fit(x.iloc[train_benign_idx])
+    model.fit(x.iloc[train_benign_idx])
+    model_training_sample = len(train_benign_idx)
 
-    if benchmark_parquet:
-        # Benchmark quality was already evaluated on the exact Parquet test set.
-        # Do not present a metadata-CSV split evaluation as benchmark performance.
-        val_metrics = None
-        test_metrics = exact_result["test"]
-    else:
-        val_scores = model.decision_function(x.iloc[val_idx])
-        test_scores = model.decision_function(x.iloc[test_idx])
+    # The historical benchmark verifier is separate. The operational SOC run
+    # always uses this metadata dataset's own train split and train-only
+    # imputation, even when --benchmark-parquet was supplied for verification.
+    val_scores = model.decision_function(x.iloc[val_idx])
+    test_scores = model.decision_function(x.iloc[test_idx])
+    validation_benign = y.iloc[val_idx].to_numpy() == 0
+    if not validation_benign.any():
+        raise ValueError("Validation split contains no benign rows for threshold calibration.")
+    # Calibrate to a 5% held-out benign alert budget, not validation F1.
+    active_threshold = float(np.quantile(val_scores[validation_benign], 0.05))
+    val_metrics = evaluate(y.iloc[val_idx], val_scores, active_threshold)
+    test_metrics = evaluate(y.iloc[test_idx], test_scores, active_threshold)
 
-        val_metrics = evaluate(y.iloc[val_idx], val_scores, FINAL_THRESHOLD)
-        test_metrics = evaluate(y.iloc[test_idx], test_scores, FINAL_THRESHOLD)
-
-        print("\nVALIDATION")
-        print(json.dumps(val_metrics, indent=2))
-        print("\nTEST")
-        print(json.dumps(test_metrics, indent=2))
+    print("\nVALIDATION (5% benign-tail threshold calibration)")
+    print(json.dumps(val_metrics, indent=2))
+    print("\nHELD-OUT TEST")
+    print(json.dumps(test_metrics, indent=2))
 
     # Score every cleaned flow using the model trained only on training BENIGN rows.
     all_scores = model.decision_function(x)
     df["anomaly_score"] = all_scores
-    df["predicted_anomaly"] = all_scores < FINAL_THRESHOLD
+    df["predicted_anomaly"] = all_scores < active_threshold
     split = np.full(len(df), "train", dtype=object)
     split[val_idx] = "validation"
     split[test_idx] = "test"
     df["split"] = split
 
+    df = merge_detector_outputs(df, anomaly_threshold=active_threshold)
     predictions_path = out / "cicids_if_predictions_with_metadata.csv"
     df.to_csv(predictions_path, index=False)
 
-    suspicious = df[df["predicted_anomaly"] & (df["label"].str.lower() != "benign")].copy()
+    # Ground-truth Label must never decide which rows enter the operational
+    # investigation. Keep false positives visible for analyst triage.
+    suspicious = df[df["alert"]].copy()
     suspicious_path = out / "suspicious_flows_with_metadata.csv"
     suspicious.to_csv(suspicious_path, index=False)
 
-    events = build_attack_events(
+    # Port-scan-only rows are retained in a secondary analyst-review queue.
+    # Weak fan-out/horizontal-scan/DoS heuristics remain in the full prediction
+    # table as context signals and never independently create incidents.
+    review_only = df[df["review_candidate"] & ~df["alert"]].copy()
+    review_path = out / "review_candidates_with_metadata.csv"
+    review_only.to_csv(review_path, index=False)
+
+    # Specialist graph analyst, threat-hunting and triage stages coordinate
+    # event formation, topology analysis and evidence-backed reporting.
+    pipeline_context = {
+        "ingestion": {
+            "input_files": list(CSV_ORDER),
+            "rows_loaded": int(len(df)),
+        },
+        "preprocessing": {
+            "feature_count": int(x.shape[1]),
+            "rows_after_metadata_preprocessing": int(len(df)),
+            "imputation_fit": "training partition only",
+            "metadata_preserved": ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol"],
+        },
+        "ml_detection": {
+            "algorithm": "IsolationForest",
+            "training_rows": int(len(train_idx)),
+            "benign_model_training_rows": int(model_training_sample),
+            "validation_benign_alert_budget": 0.05,
+            "model_alert_flows": int(df["model_alert"].sum()),
+            "threshold": float(active_threshold),
+        },
+        "behavioural_detection": {
+            "rule_alert_flows": int(df["rule_alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "context_signal_flows": int(df["context_signals"].fillna("").astype(str).ne("").sum()),
+            "actionable_rules": ["BRUTE_FORCE_PATTERN"],
+            "review_rules": ["PORT_SCAN"],
+            "context_only_rules": [
+                "HIGH_SOURCE_FANOUT",
+                "HORIZONTAL_SCAN",
+                "DISTRIBUTED_DOS_PATTERN",
+            ],
+            "review_output": str(review_path.name),
+            "policy_note": (
+                "Rule policy informed by CICIDS2017 validation metrics; "
+                "weak heuristics are context-only, port scan is review-only."
+            ),
+        },
+        "alert_fusion": {
+            "combined_alert_flows": int(df["alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "model_and_actionable_rule_or_logic": True,
+        },
+    }
+    events, graph, investigation_summary = run_soc_investigation(
         suspicious,
-        anomalous_only=True,
-        config=EventConfig(time_window_seconds=60),
+        out,
+        reasoner=reasoner,
+        pipeline_context=pipeline_context,
+        max_agent_investigations=max_agent_investigations,
     )
-    events.to_csv(out / "attack_events.csv", index=False)
 
-    graph = build_attack_graph(events)
-    graph = add_sequence_edges(graph, events)
-
+    # The SOC orchestrator owns graph persistence after incident nodes and
+    # membership edges have been added. The model runner only records status.
     gexf_path = out / "attack_graph.gexf"
-    gexf_written = False
-    try:
-        write_attack_graph_gexf(graph, str(gexf_path))
-        gexf_written = gexf_path.exists() and gexf_path.stat().st_size > 0
-    except Exception as exc:
-        print(f"GEXF write failed: {exc}")
+    gexf_written = gexf_path.exists() and gexf_path.stat().st_size > 0
+    if not gexf_written:
+        raise RuntimeError("SOC orchestrator did not persist the incident attack graph.")
 
     png_status = "skipped"
     if graph.number_of_nodes() > 0 and graph.number_of_nodes() <= 800:
@@ -788,16 +846,22 @@ def run(
         "train_rows": int(len(train_idx)),
         "validation_rows": int(len(val_idx)),
         "test_rows": int(len(test_idx)),
-        "benign_training_sample": int(len(train_benign_idx)),
+        "model_training_sample": int(model_training_sample),
         "n_estimators": FINAL_N_ESTIMATORS,
         "max_samples": FINAL_MAX_SAMPLES,
         "max_features": FINAL_MAX_FEATURES,
-        "benchmark_threshold": FINAL_THRESHOLD,
+        "active_anomaly_threshold": float(active_threshold),
+        "threshold_calibration": "5th percentile of held-out benign validation scores",
+        "historical_benchmark_threshold": FINAL_THRESHOLD,
         "benchmark_verification": exact_result if benchmark_parquet else None,
         "validation": val_metrics,
         "test": test_metrics,
-        "metadata_scoring_all_flagged_flows": int(df["predicted_anomaly"].sum()),
-        "metadata_scoring_non_benign_suspicious_flows": int(len(suspicious)),
+        "model_alert_flows": int(df["model_alert"].sum()),
+        "behavioural_rule_alert_flows": int(df["rule_alert"].sum()),
+        "combined_alert_flows": int(df["alert"].sum()),
+        "alert_flows_investigated": int(len(suspicious)),
+        "ground_truth_used_for_alert_selection": False,
+        "soc_investigation": investigation_summary,
         "attack_events": int(len(events)),
         "graph_nodes": int(graph.number_of_nodes()),
         "graph_edges": int(graph.number_of_edges()),
@@ -811,12 +875,167 @@ def run(
     )
 
     print("\nDONE")
-    print(f"All flagged flows:        {df['predicted_anomaly'].sum():,}")
-    print(f"Non-BENIGN suspicious:    {len(suspicious):,}")
+    print(f"Isolation Forest alerts:  {df['model_alert'].sum():,}")
+    print(f"Behavioural rule alerts:  {df['rule_alert'].sum():,}")
+    print(f"Combined SOC alerts:      {df['alert'].sum():,}")
+    print(f"Alert flows investigated: {len(suspicious):,}")
+    print(f"Candidate incidents:      {investigation_summary['incident_count']:,}")
     print(f"Attack events:            {len(events):,}")
     print(f"Graph nodes:              {graph.number_of_nodes():,}")
     print(f"Graph edges:              {graph.number_of_edges():,}")
     print(f"Elapsed seconds:          {time.time() - start:.2f}")
+
+
+def run_from_predictions(
+    predictions_path: str,
+    output_dir: str,
+    reasoner=None,
+    max_agent_investigations: int | None = None,
+) -> dict:
+    """Replay detector policy and SOC investigation using saved model scores.
+
+    This avoids refitting Isolation Forest when only behavioural-rule,
+    correlation or investigation logic has changed. The precomputed
+    predicted_anomaly column is treated as the immutable model output.
+    Ground-truth labels, if present, are preserved in the artefact but never
+    used for alert selection.
+    """
+    start = time.time()
+    source = Path(predictions_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Saved prediction file does not exist: {source}")
+
+    print(f"Loading saved model predictions: {source}")
+    df = pd.read_csv(source, low_memory=False, encoding="latin1")
+    df = _resolve_columns(df)
+
+    required = {"timestamp", "src_ip", "dst_ip", "protocol", "predicted_anomaly"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Saved predictions are missing required replay columns: "
+            f"{sorted(missing)}. A file with model-generated predicted_anomaly "
+            "flags is required; this mode does not retrain the model."
+        )
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Recompute behavioural tiers with the current policy, while reusing the
+    # original IF flags/scores and train/validation/test assignments.
+    df = merge_detector_outputs(df)
+    predictions_out = out / "cicids_if_predictions_with_metadata.csv"
+    df.to_csv(predictions_out, index=False)
+
+    suspicious = df[df["alert"]].copy()
+    suspicious_path = out / "suspicious_flows_with_metadata.csv"
+    suspicious.to_csv(suspicious_path, index=False)
+
+    review_only = df[df["review_candidate"] & ~df["alert"]].copy()
+    review_path = out / "review_candidates_with_metadata.csv"
+    review_only.to_csv(review_path, index=False)
+
+    split_counts = (
+        df["split"].astype(str).value_counts().to_dict()
+        if "split" in df.columns else {}
+    )
+    pipeline_context = {
+        "ingestion": {
+            "input_file": str(source),
+            "rows_loaded": int(len(df)),
+            "mode": "saved_prediction_replay",
+        },
+        "preprocessing": {
+            "mode": "reused_preprocessed_model_predictions",
+            "metadata_preserved": [
+                "timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol"
+            ],
+            "split_row_counts": {str(k): int(v) for k, v in split_counts.items()},
+        },
+        "ml_detection": {
+            "algorithm": "IsolationForest",
+            "model_refit": False,
+            "scores_reused": True,
+            "model_alert_flows": int(df["model_alert"].sum()),
+            "threshold_source": "stored predicted_anomaly flags",
+        },
+        "behavioural_detection": {
+            "rule_alert_flows": int(df["rule_alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "context_signal_flows": int(
+                df["context_signals"].fillna("").astype(str).ne("").sum()
+            ),
+            "actionable_rules": ["BRUTE_FORCE_PATTERN"],
+            "review_rules": ["PORT_SCAN"],
+            "context_only_rules": [
+                "HIGH_SOURCE_FANOUT",
+                "HORIZONTAL_SCAN",
+                "DISTRIBUTED_DOS_PATTERN",
+            ],
+            "review_output": review_path.name,
+            "policy_note": (
+                "CICIDS2017 validation-informed policy replay; weak heuristics "
+                "are context-only and port scan is review-only."
+            ),
+        },
+        "alert_fusion": {
+            "combined_alert_flows": int(df["alert"].sum()),
+            "review_only_flows": int(len(review_only)),
+            "model_and_actionable_rule_or_logic": True,
+        },
+    }
+
+    events, graph, investigation_summary = run_soc_investigation(
+        suspicious,
+        out,
+        reasoner=reasoner,
+        pipeline_context=pipeline_context,
+        max_agent_investigations=max_agent_investigations,
+    )
+    gexf_path = out / "attack_graph.gexf"
+    if not gexf_path.exists() or gexf_path.stat().st_size == 0:
+        raise RuntimeError("SOC orchestrator did not persist the incident attack graph.")
+
+    summary = {
+        "replay_mode": True,
+        "model_refit": False,
+        "source_predictions": str(source),
+        "rows_replayed": int(len(df)),
+        "model_alert_flows": int(df["model_alert"].sum()),
+        "behavioural_rule_alert_flows": int(df["rule_alert"].sum()),
+        "review_only_flows": int(len(review_only)),
+        "context_signal_flows": int(
+            df["context_signals"].fillna("").astype(str).ne("").sum()
+        ),
+        "combined_alert_flows": int(df["alert"].sum()),
+        "alert_flows_investigated": int(len(suspicious)),
+        "attack_events": int(len(events)),
+        "graph_nodes": int(graph.number_of_nodes()),
+        "graph_edges": int(graph.number_of_edges()),
+        "soc_investigation": investigation_summary,
+        "elapsed_seconds": round(time.time() - start, 2),
+        "note": (
+            "Isolation Forest was not retrained and its scores were not "
+            "re-evaluated. This run replays behavioural policy and SOC stages."
+        ),
+    }
+    (out / "pipeline_summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\nREPLAY COMPLETE")
+    print(f"Isolation Forest alerts reused: {df['model_alert'].sum():,}")
+    print(f"Actionable behavioural alerts:  {df['rule_alert'].sum():,}")
+    print(f"Port-scan review-only flows:    {len(review_only):,}")
+    print(f"Combined SOC alerts:            {df['alert'].sum():,}")
+    print(f"Alert flows investigated:       {len(suspicious):,}")
+    print(f"Candidate incidents:             {investigation_summary['incident_count']:,}")
+    print(f"Attack events:                   {len(events):,}")
+    print(f"Graph nodes:                     {graph.number_of_nodes():,}")
+    print(f"Graph edges:                     {graph.number_of_edges():,}")
+    print(f"Elapsed seconds:                 {time.time() - start:.2f}")
+    return summary
 
 
 if __name__ == "__main__":
@@ -834,8 +1053,8 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Exact cleaned_cicids2017.parquet used by isolation_forest.ipynb. "
-            "When supplied, the script verifies the benchmark reproduction and "
-            "uses the same benchmark training recipe for metadata scoring."
+            "When supplied, the script verifies the historical benchmark first. "
+            "The SOC pipeline still trains on the metadata train split."
         ),
     )
     parser.add_argument(
