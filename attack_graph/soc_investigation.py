@@ -1674,28 +1674,83 @@ class AgenticInvestigationAgent:
                 "confidence": "medium",
                 "source": "graph_convergence",
             })
-        pivot_edges = [edge for edge in graph["event_edges"] if "host_pivot" in edge["relation"]]
+        pivot_edges = [
+            edge for edge in graph["event_edges"]
+            if "host_pivot" in str(edge.get("relation", ""))
+        ]
+        # A graph can contain many event-pair edges for the same pivot host.
+        # Present one analyst finding per host, not one near-identical finding
+        # per raw edge. Keep a small representative evidence sample while
+        # retaining the total relationship count for traceability.
+        pivot_groups: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
         for edge in pivot_edges:
+            pivot_host = str(edge.get("pivot_host") or "").strip()
+            source_id = str(edge.get("from", "")).removeprefix("event:")
+            target_id = str(edge.get("to", "")).removeprefix("event:")
+            if not pivot_host or not source_id or not target_id:
+                continue
+            pivot_groups.setdefault(pivot_host, {})[(source_id, target_id)] = edge
+
+        for pivot_host, edge_map in sorted(pivot_groups.items()):
+            ordered_edges = sorted(
+                edge_map.values(),
+                key=lambda edge: (
+                    float(edge.get("gap_seconds") or 0.0),
+                    str(edge.get("from", "")),
+                    str(edge.get("to", "")),
+                ),
+            )
+            representative_edges = ordered_edges[:5]
+            evidence_event_ids = sorted({
+                event_id
+                for edge in representative_edges
+                for event_id in (
+                    str(edge["from"]).removeprefix("event:"),
+                    str(edge["to"]).removeprefix("event:"),
+                )
+            })
+            all_related_event_ids = {
+                event_id
+                for edge in ordered_edges
+                for event_id in (
+                    str(edge["from"]).removeprefix("event:"),
+                    str(edge["to"]).removeprefix("event:"),
+                )
+            }
             claims.append({
                 "claim": (
-                    f"Host {edge['pivot_host']} was targeted and subsequently initiated "
-                    "another correlated connection; this is a pivot lead."
+                    f"Host {pivot_host} appears in {len(ordered_edges)} directed "
+                    f"host-pivot relationships across {len(all_related_event_ids)} events. "
+                    "The flow graph shows this host as a destination in one event and "
+                    "the source of another correlated event. This is a pivot lead, "
+                    "not proof of lateral movement or compromise."
                 ),
-                "evidence_event_ids": [
-                    edge["from"].removeprefix("event:"),
-                    edge["to"].removeprefix("event:"),
-                ],
-                "evidence_edges": [edge],
+                "evidence_event_ids": evidence_event_ids,
+                "evidence_edges": representative_edges,
+                "related_edge_count": len(ordered_edges),
+                "evidence_edges_truncated": len(ordered_edges) > len(representative_edges),
                 "confidence": "medium",
                 "source": "host_pivot",
             })
 
+        pivot_host_count = len(pivot_groups)
+        pivot_host_preview = ", ".join(list(sorted(pivot_groups))[:5]) or "none observed"
+        pivot_suffix = (
+            f" Pivot hosts: {pivot_host_preview}."
+            if pivot_host_count else " No directed host-pivot relationship was observed."
+        )
         narrative = (
-            f"{incident['title']}. The candidate contains {len(timeline)} correlated events "
-            f"over {incident['start_time']} to {incident['end_time']}. "
-            f"Observed detection signals: {', '.join(incident['detection_reasons']) or 'none recorded'}. "
-            f"Graph evidence contains {len(graph['event_edges'])} event-to-event relationships. "
-            "Treat this as a candidate incident pending validation against endpoint, identity and service telemetry."
+            f"Assessment: {incident['title']}. "
+            f"Observed activity: {len(timeline)} correlated network events between "
+            f"{incident['start_time']} and {incident['end_time']}. "
+            f"Detection signals: {', '.join(incident['detection_reasons']) or 'none recorded'}. "
+            f"Relationship analysis: the graph contains {len(graph['event_edges'])} "
+            f"event-to-event relationships, including {len(pivot_edges)} host-pivot links "
+            f"across {pivot_host_count} pivot host(s).{pivot_suffix} "
+            "Interpretation: these are network-flow relationships and investigation leads; "
+            "they do not establish successful authentication, lateral movement or compromise. "
+            "Next validation: compare this time window and the listed hosts with authentication, "
+            "endpoint/EDR and service logs before treating the activity as a confirmed attack."
         )
         model_findings: list[dict[str, Any]] = []
         model_finding_candidates: list[dict[str, Any]] = []
