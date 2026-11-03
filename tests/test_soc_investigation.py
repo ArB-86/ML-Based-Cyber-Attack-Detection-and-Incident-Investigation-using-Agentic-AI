@@ -243,6 +243,7 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
             "narrative": "Host B is a pivot lead; validate using endpoint telemetry.",
             "findings": [
                 {
+                    "claim_type": "host_pivot_lead",
                     "claim": "Host B was targeted and later initiated another connection.",
                     "evidence_event_ids": ["EVT-000001", "EVT-000002"],
                     "confidence": "medium",
