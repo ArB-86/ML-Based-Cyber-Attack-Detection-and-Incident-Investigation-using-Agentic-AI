@@ -229,6 +229,10 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
                     },
                     {
                         "name": "get_event",
+                        "arguments": {"event_id": "EVT-000001"},
+                    },
+                    {
+                        "name": "get_event",
                         "arguments": {"event_id": "EVT-999999"},
                     },
                     {
@@ -270,6 +274,10 @@ def test_llm_agent_selects_scoped_tools_and_rejects_unsupported_evidence(tmp_pat
     )
     assert any(
         call["tool"] == "get_correlated_events" and call["status"] == "success"
+        for call in agent["tool_calls"]
+    )
+    assert any(
+        call["tool"] == "get_event" and call["status"] == "success"
         for call in agent["tool_calls"]
     )
     assert any(
