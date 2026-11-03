@@ -6,6 +6,7 @@ from attack_graph.event_builder import EventConfig, build_attack_events
 from attack_graph.soc_detection import BehaviourThresholds, detect_behavioral_alerts, merge_detector_outputs
 from attack_graph.pipeline import PipelineConfig, run_pipeline
 from attack_graph.soc_investigation import (
+    AgenticInvestigationAgent,
     EventCorrelationAgent,
     IncidentFormationAgent,
     build_soc_events,
@@ -1199,3 +1200,103 @@ def test_t1021_evidence_contains_only_exact_remote_service_pivot_pair():
     assert len(remote) == 1
     assert remote[0]["evidence_event_ids"] == ["IN", "OUT"]
     assert remote[0]["evidence_edges"][0]["remote_service_ports"] == [22]
+
+
+def test_agentic_findings_aggregate_repeated_host_pivot_edges():
+    class FakeEvidenceTools:
+        def __init__(self):
+            event_ids = [f"E{i:03d}" for i in range(42)]
+            self.timeline = [{"event_id": event_id} for event_id in event_ids]
+            self.edges = []
+            for index in range(40):
+                self.edges.append({
+                    "from": f"event:E{index:03d}",
+                    "to": f"event:E{index + 1:03d}",
+                    "relation": "host_pivot",
+                    "gap_seconds": 0.0,
+                    "pivot_host": "10.0.0.8",
+                })
+            self.edges.extend([
+                {
+                    "from": "event:E040", "to": "event:E041",
+                    "relation": "host_pivot", "gap_seconds": 30.0,
+                    "pivot_host": "10.0.0.9",
+                },
+                {
+                    "from": "event:E040", "to": "event:E041",
+                    "relation": "host_pivot", "gap_seconds": 30.0,
+                    "pivot_host": "10.0.0.9",
+                },
+            ])
+            self.incident = {
+                "incident_id": "INC-00001",
+                "title": "Repeated authentication-related flow pattern requiring validation",
+                "start_time": "2026-01-01T10:00:00+00:00",
+                "end_time": "2026-01-01T10:05:00+00:00",
+                "event_ids": event_ids,
+                "detection_reasons": ["BRUTE_FORCE_PATTERN"],
+                "review_reasons": [],
+                "context_signals": [],
+                "triage": {"severity": "MEDIUM"},
+                "graph_analysis": {
+                    "max_source_fanout": 1,
+                    "top_sources": [],
+                    "max_target_fanin": 1,
+                    "top_targets": [],
+                },
+                "attack_hypotheses": [],
+                "recommended_actions": [],
+            }
+
+        def get_incident(self, incident_id):
+            assert incident_id == "INC-00001"
+            return self.incident
+
+        def get_timeline(self, incident_id):
+            return self.timeline
+
+        def get_graph_neighborhood(self, incident_id):
+            return {
+                "event_edges": self.edges,
+                "related_nodes": [],
+                "member_event_nodes": [f"event:{item['event_id']}" for item in self.timeline],
+            }
+
+        def get_detection_evidence(self, incident_id):
+            return {
+                "reason_to_event_ids": {"BRUTE_FORCE_PATTERN": ["E000", "E001"]},
+                "source_to_event_ids": {"BEHAVIOURAL_RULE": ["E000", "E001"]},
+                "review_reason_to_event_ids": {},
+                "context_signal_to_event_ids": {},
+            }
+
+        def get_event(self, event_id):
+            return {"event_id": event_id}
+
+        def get_host_activity(self, incident_id, host_ip):
+            return []
+
+        def get_service_activity(self, incident_id, destination_port, protocol=None):
+            return []
+
+        def get_correlated_events(self, incident_id, event_id=None, relation_contains=None):
+            return self.edges
+
+    result = AgenticInvestigationAgent(FakeEvidenceTools()).investigate("INC-00001")
+    pivot_findings = [
+        finding for finding in result["findings"]
+        if finding["source"] == "host_pivot"
+    ]
+
+    assert len(pivot_findings) == 2
+    first = next(item for item in pivot_findings if "10.0.0.8" in item["claim"])
+    second = next(item for item in pivot_findings if "10.0.0.9" in item["claim"])
+    assert first["related_edge_count"] == 40
+    assert len(first["evidence_edges"]) == 5
+    assert first["evidence_edges_truncated"] is True
+    assert len(first["evidence_event_ids"]) <= 10
+    assert second["related_edge_count"] == 1
+    assert "not proof of lateral movement or compromise" in first["claim"]
+    assert result["narrative"].startswith("Assessment:")
+    assert "Next validation:" in result["narrative"]
+
