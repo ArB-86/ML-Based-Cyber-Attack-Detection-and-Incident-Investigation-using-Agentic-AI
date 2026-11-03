@@ -520,6 +520,59 @@ def test_llm_agent_supports_two_bounded_tool_rounds(tmp_path):
     assert model_finding["analyst_validation_required"] is True
 
 
+def test_agent_retains_preliminary_findings_when_final_findings_are_empty(tmp_path):
+    flows = pd.DataFrame([
+        {
+            "timestamp": _time(0), "src_ip": "A", "dst_ip": "B", "protocol": 6,
+            "src_port": 50000, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.01,
+        },
+        {
+            "timestamp": _time(1), "src_ip": "A", "dst_ip": "C", "protocol": 6,
+            "src_port": 50001, "dst_port": 443, "alert": True,
+            "detection_reasons": "ISOLATION_FOREST_ANOMALY",
+            "alert_sources": "ISOLATION_FOREST", "anomaly_score": 0.02,
+        },
+    ])
+
+    def fake_reasoner(context):
+        return {
+            "tool_calls": [],
+            "preliminary_findings": [{
+                "claim_type": "isolation_forest_anomaly",
+                "claim": "Both events carry Isolation Forest anomaly metadata.",
+                "evidence_event_ids": ["EVT-000001", "EVT-000002"],
+                "confidence": "high",
+            }],
+            # A required but empty final findings array must not erase
+            # the already-produced preliminary finding.
+            "findings": [],
+            "narrative": "Two events carry Isolation Forest detector metadata.",
+        }
+
+    run_soc_investigation(flows, tmp_path, reasoner=fake_reasoner)
+    payload = json.loads(
+        (tmp_path / "incident_investigation.json").read_text()
+    )
+    agent = payload["incidents"][0]["investigation_agent"]
+
+    assert agent["mode"] == "tool_assisted_llm"
+    assert agent["model_findings_proposed"] == 1
+    assert agent["model_findings_accepted"] == 1
+    finding = next(
+        item for item in agent["findings"]
+        if item["source"] == "llm_semantic_validated"
+    )
+    assert finding["claim_type"] == "isolation_forest_anomaly"
+    assert finding["validation_scope"] == "detector_metadata_predicate"
+    assert finding["claim_semantics_independently_verified"] is True
+    assert agent["reasoner_calls"][0]["finding_counts"] == {
+        "preliminary_findings": 1,
+        "findings": 0,
+    }
+
+
 def test_semantic_validator_requires_matching_detection_provenance():
     from attack_graph.soc_investigation import _validate_model_finding
 
